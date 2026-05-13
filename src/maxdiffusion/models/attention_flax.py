@@ -1709,6 +1709,8 @@ class FlaxFluxAttention(nn.Module):
   out_axis_names: AxisNames = (BATCH, LENGTH, EMBED)
   precision: jax.lax.Precision = None
   qkv_bias: bool = False
+  use_base2_exp: bool = False
+  use_experimental_scheduler: bool = False
 
   def setup(self):
     if self.attention_kernel in {"flash", "cudnn_flash_te"} and self.mesh is None:
@@ -1728,6 +1730,8 @@ class FlaxFluxAttention(nn.Module):
         flash_block_sizes=self.flash_block_sizes,
         dtype=self.dtype,
         float32_qk_product=False,
+        use_base2_exp=self.use_base2_exp,
+        use_experimental_scheduler=self.use_experimental_scheduler,
     )
 
     kernel_axes = ("embed", "heads")
