@@ -163,6 +163,7 @@ class FluxSingleTransformerBlock(nn.Module):
       )
       
       hidden_states = self.linear2(attn_mlp)
+      hidden_states = checkpoint_name(hidden_states, "lin2_hidden_states")
       
       hidden_states = gate * hidden_states
       hidden_states = residual + hidden_states
@@ -435,7 +436,7 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
     # 2. Force strict checkpointing on the Double Wrapper
     #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
     #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
+    RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("img_qkv_proj", "txt_qkv_proj"))
 
     self.scanned_double_blocks = nn.scan(
         RemattedDoubleWrapper,
@@ -463,7 +464,7 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
     # 4. Force strict checkpointing on the Single Wrapper
     #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
     #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
+    RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("lin1_norm_hidden_states", "lin2_hidden_states"))
 
     self.scanned_single_blocks = nn.scan(
         RemattedSingleWrapper,
