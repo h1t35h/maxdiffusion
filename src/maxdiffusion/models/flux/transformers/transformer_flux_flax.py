@@ -131,11 +131,6 @@ class FluxSingleTransformerBlock(nn.Module):
       norm_hidden_states = self.linear1(norm_hidden_states)
       norm_hidden_states = checkpoint_name(norm_hidden_states, "lin1_norm_hidden_states")
 
-      # FIX: Enforce valid axis constraints prior to splitting the massive projection tensor
-      norm_hidden_states = nn.with_logical_constraint(
-          norm_hidden_states, ("activation_batch", None, "mlp")
-      )
-      
       qkv, mlp = jnp.split(norm_hidden_states, [3 * self.dim], axis=-1)
     
     with jax.named_scope("hitesy-scope-single-attn"), jax.profiler.TraceAnnotation("hitesy-trace-single-attn"):
