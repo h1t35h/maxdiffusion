@@ -16,6 +16,7 @@ limitations under the License.
 
 from typing import Tuple
 import jax
+from maxdiffusion import max_logging
 import math
 import jax.numpy as jnp
 import flax
@@ -116,6 +117,7 @@ class FluxSingleTransformerBlock(nn.Module):
     )
 
   def __call__(self, hidden_states, temb, image_rotary_emb=None):
+    max_logging.log(f"[hitesy-optim-shapes-single-block] FluxSingleTransformerBlock hidden_states={hidden_states.shape}")
     residual = hidden_states
     
     # FIX: Constrain inputs using valid config parameters (None skips sequence length axis parsing)
@@ -123,52 +125,55 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states, ("activation_batch", None, "mlp")
     )
     
-    norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-    
-    norm_hidden_states = self.linear1(norm_hidden_states)
-    norm_hidden_states = checkpoint_name(norm_hidden_states, "lin1_norm_hidden_states")
+    with jax.named_scope("hitesy-scope-single-norm-lin1"), jax.profiler.TraceAnnotation("hitesy-trace-single-norm-lin1"):
+      norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+      
+      norm_hidden_states = self.linear1(norm_hidden_states)
+      norm_hidden_states = checkpoint_name(norm_hidden_states, "lin1_norm_hidden_states")
 
-    # FIX: Enforce valid axis constraints prior to splitting the massive projection tensor
-    norm_hidden_states = nn.with_logical_constraint(
-        norm_hidden_states, ("activation_batch", None, "mlp")
-    )
+      # FIX: Enforce valid axis constraints prior to splitting the massive projection tensor
+      norm_hidden_states = nn.with_logical_constraint(
+          norm_hidden_states, ("activation_batch", None, "mlp")
+      )
+      
+      qkv, mlp = jnp.split(norm_hidden_states, [3 * self.dim], axis=-1)
     
-    qkv, mlp = jnp.split(norm_hidden_states, [3 * self.dim], axis=-1)
-    
-    B, L = hidden_states.shape[:2]
-    H, D, K = self.num_attention_heads, qkv.shape[-1] // (self.num_attention_heads * 3), 3
-    
-    qkv_proj = qkv.reshape(B, L, K, H, D).transpose(2, 0, 3, 1, 4)
-    q, k, v = qkv_proj
+    with jax.named_scope("hitesy-scope-single-attn"), jax.profiler.TraceAnnotation("hitesy-trace-single-attn"):
+      B, L = hidden_states.shape[:2]
+      H, D, K = self.num_attention_heads, qkv.shape[-1] // (self.num_attention_heads * 3), 3
+      
+      qkv_proj = qkv.reshape(B, L, K, H, D).transpose(2, 0, 3, 1, 4)
+      q, k, v = qkv_proj
 
-    q = self.attn.query_norm(q)
-    k = self.attn.key_norm(k)
+      q = self.attn.query_norm(q)
+      k = self.attn.key_norm(k)
 
-    if image_rotary_emb is not None:
-      image_rotary_emb_reordered = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
-      q, k = apply_rope(q, k, image_rotary_emb_reordered)
+      if image_rotary_emb is not None:
+        image_rotary_emb_reordered = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+        q, k = apply_rope(q, k, image_rotary_emb_reordered)
 
-    q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
-    k = k.transpose(0, 2, 1, 3).reshape(k.shape[0], k.shape[2], -1)
-    v = v.transpose(0, 2, 1, 3).reshape(v.shape[0], v.shape[2], -1)
+      q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
+      k = k.transpose(0, 2, 1, 3).reshape(k.shape[0], k.shape[2], -1)
+      v = v.transpose(0, 2, 1, 3).reshape(v.shape[0], v.shape[2], -1)
 
-    attn_output = self.attn.attention_op.apply_attention(q, k, v)
+      attn_output = self.attn.attention_op.apply_attention(q, k, v)
 
-    # Re-combine streams smoothly
-    attn_mlp = jnp.concatenate([attn_output, self.mlp_act(mlp)], axis=2)
-    
-    # FIX: Enforce a clean exit layout before executing linear2
-    attn_mlp = nn.with_logical_constraint(
-        attn_mlp, ("activation_batch", None, "mlp")
-    )
-    
-    hidden_states = self.linear2(attn_mlp)
-    
-    hidden_states = gate * hidden_states
-    hidden_states = residual + hidden_states
-    
-    if hidden_states.dtype == jnp.float16:
-      hidden_states = jnp.clip(hidden_states, -65504, 65504)
+    with jax.named_scope("hitesy-scope-single-mlp-lin2"), jax.profiler.TraceAnnotation("hitesy-trace-single-mlp-lin2"):
+      # Re-combine streams smoothly
+      attn_mlp = jnp.concatenate([attn_output, self.mlp_act(mlp)], axis=2)
+      
+      # FIX: Enforce a clean exit layout before executing linear2
+      attn_mlp = nn.with_logical_constraint(
+          attn_mlp, ("activation_batch", None, "mlp")
+      )
+      
+      hidden_states = self.linear2(attn_mlp)
+      
+      hidden_states = gate * hidden_states
+      hidden_states = residual + hidden_states
+      
+      if hidden_states.dtype == jnp.float16:
+        hidden_states = jnp.clip(hidden_states, -65504, 65504)
 
     return hidden_states
 
@@ -254,52 +259,57 @@ class FluxTransformerBlock(nn.Module):
     ])
 
   def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None):
+    max_logging.log(f"[hitesy-optim-shapes-double-block] FluxTransformerBlock hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}")
     # Enforce active partitioning based on your FSDP setup config
     hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", None, "mlp"))
     encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", None, "mlp"))
 
     # 1. First Adaptive Normalization Pass
-    norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.img_norm1(hidden_states, emb=temb)
-    norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.txt_norm1(
-        encoder_hidden_states, emb=temb
-    )
+    with jax.named_scope("hitesy-scope-double-norm1"), jax.profiler.TraceAnnotation("hitesy-trace-double-norm1"):
+      norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.img_norm1(hidden_states, emb=temb)
+      norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.txt_norm1(
+          encoder_hidden_states, emb=temb
+      )
 
     # 2. Attention Mechanics
-    attn_output, context_attn_output = self.attn(
-        hidden_states=norm_hidden_states,
-        encoder_hidden_states=norm_encoder_hidden_states,
-        image_rotary_emb=image_rotary_emb,
-    )
+    with jax.named_scope("hitesy-scope-double-attn"), jax.profiler.TraceAnnotation("hitesy-trace-double-attn"):
+      attn_output, context_attn_output = self.attn(
+          hidden_states=norm_hidden_states,
+          encoder_hidden_states=norm_encoder_hidden_states,
+          image_rotary_emb=image_rotary_emb,
+      )
 
     # --- IMAGE STREAM OPTIMIZATION (img_norm2) ---
-    attn_output = gate_msa * attn_output
-    hidden_states = hidden_states + attn_output
-    
-    # Fully fused LayerNorm + scale_mlp + shift_mlp compilation block
-    img_mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
-    img_var = jnp.mean(jnp.square(hidden_states - img_mean), axis=-1, keepdims=True)
-    img_inv_std = jax.lax.rsqrt(img_var + self.eps)
-    
-    norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
-    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", None, "mlp"))
+    with jax.named_scope("hitesy-scope-double-img-mlp"), jax.profiler.TraceAnnotation("hitesy-trace-double-img-mlp"):
+      attn_output = gate_msa * attn_output
+      hidden_states = hidden_states + attn_output
+      
+      # Fully fused LayerNorm + scale_mlp + shift_mlp compilation block
+      img_mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
+      img_var = jnp.mean(jnp.square(hidden_states - img_mean), axis=-1, keepdims=True)
+      img_inv_std = jax.lax.rsqrt(img_var + self.eps)
+      
+      norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
+      norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", None, "mlp"))
 
-    ff_output = self.img_mlp(norm_hidden_states)
-    hidden_states = hidden_states + gate_mlp * ff_output
+      ff_output = self.img_mlp(norm_hidden_states)
+      hidden_states = hidden_states + gate_mlp * ff_output
 
     # --- TEXT STREAM OPTIMIZATION (txt_norm2) ---
-    context_attn_output = c_gate_msa * context_attn_output
-    encoder_hidden_states = encoder_hidden_states + context_attn_output
+    with jax.named_scope("hitesy-scope-double-txt-mlp"), jax.profiler.TraceAnnotation("hitesy-trace-double-txt-mlp"):
+      context_attn_output = c_gate_msa * context_attn_output
+      encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-    # Fully fused LayerNorm + c_scale_mlp + c_shift_mlp compilation block
-    txt_mean = jnp.mean(encoder_hidden_states, axis=-1, keepdims=True)
-    txt_var = jnp.mean(jnp.square(encoder_hidden_states - txt_mean), axis=-1, keepdims=True)
-    txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
+      # Fully fused LayerNorm + c_scale_mlp + c_shift_mlp compilation block
+      txt_mean = jnp.mean(encoder_hidden_states, axis=-1, keepdims=True)
+      txt_var = jnp.mean(jnp.square(encoder_hidden_states - txt_mean), axis=-1, keepdims=True)
+      txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
 
-    norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
-    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", None, "mlp"))
+      norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
+      norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", None, "mlp"))
 
-    context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
-    encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+      context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
+      encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
     
     # Safe numerical clipping limits for half precision math execution
     if encoder_hidden_states.dtype == jnp.float16 or encoder_hidden_states.dtype == jnp.bfloat16:
@@ -529,49 +539,59 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       return_dict: bool = True,
       train: bool = False,
   ):
-    hidden_states = self.img_in(hidden_states)
-    timestep = self.timestep_embedding(timestep, 256)
-    timestep = nn.with_logical_constraint(timestep, ("activation_batch", None))
+    max_logging.log(f"[hitesy-optim-shapes-transformer2d] Transformer2DModel __call__ inputs: hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}, pooled_projections={pooled_projections.shape}")
+    with jax.named_scope("hitesy-scope-embed-proj"), jax.profiler.TraceAnnotation("hitesy-trace-embed-proj"):
+      hidden_states = self.img_in(hidden_states)
+      timestep = self.timestep_embedding(timestep, 256)
+      timestep = nn.with_logical_constraint(timestep, ("activation_batch", None))
 
-    if self.guidance_embeds:
-      guidance = self.timestep_embedding(guidance, 256)
-    else:
-      guidance = None
-    temb = (
-        self.time_text_embed(timestep, pooled_projections)
-        if guidance is None
-        else self.time_text_embed(timestep, guidance, pooled_projections)
-    )
+      if self.guidance_embeds:
+        guidance = self.timestep_embedding(guidance, 256)
+      else:
+        guidance = None
+      temb = (
+          self.time_text_embed(timestep, pooled_projections)
+          if guidance is None
+          else self.time_text_embed(timestep, guidance, pooled_projections)
+      )
 
-    temb = nn.with_logical_constraint(temb, ("activation_batch", None))
+      temb = nn.with_logical_constraint(temb, ("activation_batch", None))
 
-    encoder_hidden_states = self.txt_in(encoder_hidden_states)
-    if txt_ids.ndim == 3:
-      txt_ids = txt_ids[0]
-    if img_ids.ndim == 3:
-      img_ids = img_ids[0]
+      encoder_hidden_states = self.txt_in(encoder_hidden_states)
+      if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
+      if img_ids.ndim == 3:
+        img_ids = img_ids[0]
 
-    ids = jnp.concatenate((txt_ids, img_ids), axis=0)
-    ids = nn.with_logical_constraint(ids, ("activation_batch", None))
-    image_rotary_emb = self.pe_embedder(ids)
-    image_rotary_emb = nn.with_logical_constraint(image_rotary_emb, (None, None))
+      ids = jnp.concatenate((txt_ids, img_ids), axis=0)
+      ids = nn.with_logical_constraint(ids, ("activation_batch", None))
+      image_rotary_emb = self.pe_embedder(ids)
+      image_rotary_emb = nn.with_logical_constraint(image_rotary_emb, (None, None))
 
-    carry = (hidden_states, encoder_hidden_states, temb, image_rotary_emb)
-    carry, _ = self.scanned_double_blocks(carry, None)
-    hidden_states, encoder_hidden_states, _, _ = carry
+    max_logging.log(f"[hitesy-optim-shapes-double-blocks-in] Entering scanned_double_blocks. hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}")
+    with jax.named_scope("hitesy-scope-double-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-double-blocks"):
+      carry = (hidden_states, encoder_hidden_states, temb, image_rotary_emb)
+      carry, _ = self.scanned_double_blocks(carry, None)
+      hidden_states, encoder_hidden_states, _, _ = carry
 
-    hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "activation_embed"))
+    with jax.named_scope("hitesy-scope-concat-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-concat-blocks"):
+      hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
+      hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "activation_embed"))
     
-    # Execute the 38 Single Blocks
-    carry = (hidden_states, temb, image_rotary_emb)
-    carry, _ = self.scanned_single_blocks(carry, None)
-    hidden_states, _, _ = carry
+    max_logging.log(f"[hitesy-optim-shapes-single-blocks-in] Entering scanned_single_blocks. concatenated hidden_states={hidden_states.shape}")
+    with jax.named_scope("hitesy-scope-single-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-single-blocks"):
+      # Execute the 38 Single Blocks
+      carry = (hidden_states, temb, image_rotary_emb)
+      carry, _ = self.scanned_single_blocks(carry, None)
+      hidden_states, _, _ = carry
 
-    hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+    with jax.named_scope("hitesy-scope-output-proj"), jax.profiler.TraceAnnotation("hitesy-trace-output-proj"):
+      hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
 
-    hidden_states = self.norm_out(hidden_states, temb)
-    output = self.proj_out(hidden_states)
+      hidden_states = self.norm_out(hidden_states, temb)
+      output = self.proj_out(hidden_states)
+
+    max_logging.log(f"[hitesy-optim-shapes-transformer2d-out] Transformer2DModel output sample={output.shape}")
 
     if not return_dict:
       return (output,)

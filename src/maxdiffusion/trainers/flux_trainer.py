@@ -82,6 +82,9 @@ class FluxTrainer(FluxCheckpointer):
     # Hook
     # self.pre_training_steps()
     # Load checkpoint - will load or create states
+    max_logging.log(f"[hitesy-optim-config] Starting Flux Trainer on TPU v6e-8. per_device_batch_size: {self.config.per_device_batch_size}, total_train_batch_size: {self.total_train_batch_size}")
+    max_logging.log(f"[hitesy-optim-config] Model Architecture config: layers={self.config.num_layers}, single_layers={self.config.num_single_layers}, heads={self.config.num_attention_heads}, head_dim={self.config.attention_head_dim}")
+    max_logging.log(f"[hitesy-optim-config] Attention kernel: {self.config.attention_kernel}, Remat policy: {self.config.remat_policy}")
     with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       pipeline, params = self.load_checkpoint()
 
@@ -183,6 +186,8 @@ class FluxTrainer(FluxCheckpointer):
     )
     input_ids_dtype = self.config.activations_dtype
 
+    max_logging.log(f"[hitesy-optim-shapes-input] Dummy batch shapes for compilation: pixel_values={batch_image_shape}, text_embeds={text_shape}, prompt_embeds={prompt_embeds_shape}")
+
     shaped_batch = {}
     shaped_batch["pixel_values"] = jax.ShapeDtypeStruct(batch_image_shape, input_ids_dtype)
     shaped_batch["text_embeds"] = jax.ShapeDtypeStruct(text_shape, input_ids_dtype)
@@ -275,7 +280,7 @@ class FluxTrainer(FluxCheckpointer):
         "input_ids": input_ids,
         "text_embeds": text_embeds,
         "prompt_embeds": prompt_embeds,
-        "image_ids": image_ids,
+        "img_ids": img_ids,
       }
 
     # If using synthetic data
@@ -375,6 +380,7 @@ class FluxTrainer(FluxCheckpointer):
           donate_argnums=(0,),
       )
       max_logging.log("Precompiling...")
+      max_logging.log(f"[hitesy-optim-compilation] Lowering p_train_step with abstract flux_state and dummy_batch...")
       s = time.time()
       dummy_batch = self.get_shaped_batch(self.config, pipeline)
       abstract_flux_state = jax.tree_util.tree_map(
@@ -483,41 +489,50 @@ def _train_step(flux_state, batch, train_rng, guidance_vec, pipeline, scheduler,
     prompt_embeds = batch["prompt_embeds"]
     img_ids = batch["img_ids"]
 
-    # Sample noise that we'll add to the latents
-    noise_rng, timestep_rng = jax.random.split(sample_rng)
-    noise = jax.random.normal(
-        key=noise_rng,
-        shape=latents.shape,
-        dtype=latents.dtype,
-    )
-    # Sample a random timestep for each image
-    bsz = latents.shape[0]
-    timesteps = jax.random.randint(timestep_rng, shape=(bsz,), minval=0, maxval=len(scheduler.timesteps) - 1)
-    noisy_latents = pipeline.scheduler.add_noise(scheduler, latents, noise, timesteps, flux=True)
+    max_logging.log(f"[hitesy-optim-shapes-train-step] compute_loss traced shapes: latents={latents.shape}, text_embeds={text_embeds.shape}, prompt_embeds={prompt_embeds.shape}")
 
-    model_pred = pipeline.flux.apply(
-        {"params": state_params[FLUX_STATE_KEY]},
-        hidden_states=noisy_latents,
-        img_ids=img_ids,
-        encoder_hidden_states=text_embeds,
-        txt_ids=text_embeds_ids,
-        timestep=scheduler.timesteps[timesteps],
-        guidance=guidance_vec,
-        pooled_projections=prompt_embeds,
-    ).sample
+    with jax.named_scope("hitesy-scope-loss-prep"), jax.profiler.TraceAnnotation("hitesy-trace-loss-prep"):
+      # Sample noise that we'll add to the latents
+      noise_rng, timestep_rng = jax.random.split(sample_rng)
+      noise = jax.random.normal(
+          key=noise_rng,
+          shape=latents.shape,
+          dtype=latents.dtype,
+      )
+      # Sample a random timestep for each image
+      bsz = latents.shape[0]
+      timesteps = jax.random.randint(timestep_rng, shape=(bsz,), minval=0, maxval=len(scheduler.timesteps) - 1)
 
-    target = noise - latents
-    loss = (target - model_pred) ** 2
+    with jax.named_scope("hitesy-scope-add-noise"), jax.profiler.TraceAnnotation("hitesy-trace-add-noise"):
+      noisy_latents = pipeline.scheduler.add_noise(scheduler, latents, noise, timesteps, flux=True)
 
-    loss = jnp.mean(loss)
+    with jax.named_scope("hitesy-scope-flux-forward"), jax.profiler.TraceAnnotation("hitesy-trace-flux-forward"):
+      model_pred = pipeline.flux.apply(
+          {"params": state_params[FLUX_STATE_KEY]},
+          hidden_states=noisy_latents,
+          img_ids=img_ids,
+          encoder_hidden_states=text_embeds,
+          txt_ids=text_embeds_ids,
+          timestep=scheduler.timesteps[timesteps],
+          guidance=guidance_vec,
+          pooled_projections=prompt_embeds,
+      ).sample
+
+    with jax.named_scope("hitesy-scope-loss-calc"), jax.profiler.TraceAnnotation("hitesy-trace-loss-calc"):
+      target = noise - latents
+      loss = (target - model_pred) ** 2
+      loss = jnp.mean(loss)
 
     return loss
 
-  grad_fn = jax.value_and_grad(compute_loss)
-  loss, grad = grad_fn(state_params)
+  with jax.named_scope("hitesy-scope-backprop"), jax.profiler.TraceAnnotation("hitesy-trace-backprop"):
+    grad_fn = jax.value_and_grad(compute_loss)
+    loss, grad = grad_fn(state_params)
 
-  new_state = flux_state.apply_gradients(grads=grad[FLUX_STATE_KEY])
+  with jax.named_scope("hitesy-scope-optimizer-step"), jax.profiler.TraceAnnotation("hitesy-trace-optimizer-step"):
+    new_state = flux_state.apply_gradients(grads=grad[FLUX_STATE_KEY])
 
   metrics = {"scalar": {"learning/loss": loss}, "scalars": {}}
 
   return new_state, metrics, new_train_rng
+

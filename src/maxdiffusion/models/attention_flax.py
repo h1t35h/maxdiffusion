@@ -945,6 +945,7 @@ def _apply_attention(
   """Routes to different attention kernels using a module-level registry."""
 
   _check_attention_inputs(query, key, value)
+  max_logging.log(f"[hitesy-optim-kernel-routing] _apply_attention routing: requested_kernel={attention_kernel}, q={query.shape}, k={key.shape}, v={value.shape}, can_use_flash={attention_kernel in ['flash', 'tokamax_flash', 'ulysses', 'ulysses_custom']}")
   seq_len_idx = 1
   if query.ndim == 4:
     seq_len_idx = 2
@@ -1805,63 +1806,69 @@ class FlaxFluxAttention(nn.Module):
     B, L = hidden_states.shape[:2]
     # Deduce dimensions cleanly from class attributes
     H, D = self.heads, self.dim_head
+    max_logging.log(f"[hitesy-optim-shapes-flux-attn] FlaxFluxAttention __call__: hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape if encoder_hidden_states is not None else None}, heads={H}, dim_head={D}")
 
-    qkv_proj = self.qkv(hidden_states)
-    qkv_proj = checkpoint_name(qkv_proj, "img_qkv_proj")
-    
-    qkv_proj = qkv_proj.reshape(B, L, 3, H, D)
-    query_proj, key_proj, value_proj = [qkv_proj[:, :, i, ...] for i in range(3)]
+    with jax.named_scope("hitesy-scope-flux-attn-img-qkv"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-img-qkv"):
+      qkv_proj = self.qkv(hidden_states)
+      qkv_proj = checkpoint_name(qkv_proj, "img_qkv_proj")
+      
+      qkv_proj = qkv_proj.reshape(B, L, 3, H, D)
+      query_proj, key_proj, value_proj = [qkv_proj[:, :, i, ...] for i in range(3)]
 
-    query_proj = self.query_norm(query_proj)
-    key_proj = self.key_norm(key_proj)
+      query_proj = self.query_norm(query_proj)
+      key_proj = self.key_norm(key_proj)
 
     if encoder_hidden_states is not None:
-      B_enc, L_txt = encoder_hidden_states.shape[:2]
-      encoder_qkv_proj = self.encoder_qkv(encoder_hidden_states)
-      encoder_qkv_proj = checkpoint_name(encoder_qkv_proj, "txt_qkv_proj")
-      encoder_qkv_proj = encoder_qkv_proj.reshape(B_enc, L_txt, 3, H, D)
-      enc_query_proj, enc_key_proj, enc_value_proj = [encoder_qkv_proj[:, :, i, ...] for i in range(3)]
+      with jax.named_scope("hitesy-scope-flux-attn-txt-qkv"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-txt-qkv"):
+        B_enc, L_txt = encoder_hidden_states.shape[:2]
+        encoder_qkv_proj = self.encoder_qkv(encoder_hidden_states)
+        encoder_qkv_proj = checkpoint_name(encoder_qkv_proj, "txt_qkv_proj")
+        encoder_qkv_proj = encoder_qkv_proj.reshape(B_enc, L_txt, 3, H, D)
+        enc_query_proj, enc_key_proj, enc_value_proj = [encoder_qkv_proj[:, :, i, ...] for i in range(3)]
 
-      encoder_query_proj = self.encoder_query_norm(enc_query_proj)
-      encoder_key_proj = self.encoder_key_norm(enc_key_proj)
+        encoder_query_proj = self.encoder_query_norm(enc_query_proj)
+        encoder_key_proj = self.encoder_key_norm(enc_key_proj)
 
-      query_proj = jnp.concatenate((encoder_query_proj, query_proj), axis=1)
-      key_proj = jnp.concatenate((encoder_key_proj, key_proj), axis=1)
-      value_proj = jnp.concatenate((enc_value_proj, value_proj), axis=1)
+        query_proj = jnp.concatenate((encoder_query_proj, query_proj), axis=1)
+        key_proj = jnp.concatenate((encoder_key_proj, key_proj), axis=1)
+        value_proj = jnp.concatenate((enc_value_proj, value_proj), axis=1)
 
-      # query_proj = nn.with_logical_constraint(query_proj, self.query_axis_names)
-      # key_proj = nn.with_logical_constraint(key_proj, self.key_axis_names)
-      # value_proj = nn.with_logical_constraint(value_proj, self.value_axis_names)
+        # query_proj = nn.with_logical_constraint(query_proj, self.query_axis_names)
+        # key_proj = nn.with_logical_constraint(key_proj, self.key_axis_names)
+        # value_proj = nn.with_logical_constraint(value_proj, self.value_axis_names)
 
-    image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+    with jax.named_scope("hitesy-scope-flux-attn-rope"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-rope"):
+      image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
 
-    query_proj = query_proj.swapaxes(1, 2)
-    key_proj = key_proj.swapaxes(1, 2)
-    query_proj, key_proj = apply_rope(query_proj, key_proj, image_rotary_emb)
-    query_proj = query_proj.swapaxes(1, 2)
-    key_proj = key_proj.swapaxes(1, 2)
+      query_proj = query_proj.swapaxes(1, 2)
+      key_proj = key_proj.swapaxes(1, 2)
+      query_proj, key_proj = apply_rope(query_proj, key_proj, image_rotary_emb)
+      query_proj = query_proj.swapaxes(1, 2)
+      key_proj = key_proj.swapaxes(1, 2)
 
-    query_proj = query_proj.reshape(B, -1, H * D)
-    key_proj = key_proj.reshape(B, -1, H * D)
-    value_proj = value_proj.reshape(B, -1, H * D)
+      query_proj = query_proj.reshape(B, -1, H * D)
+      key_proj = key_proj.reshape(B, -1, H * D)
+      value_proj = value_proj.reshape(B, -1, H * D)
 
     if encoder_hidden_states is not None:
       query_proj = nn.with_logical_constraint(query_proj, self.query_axis_names)
       key_proj = nn.with_logical_constraint(key_proj, self.key_axis_names)
       value_proj = nn.with_logical_constraint(value_proj, self.value_axis_names)
 
-    attn_output = self.attention_op.apply_attention(query_proj, key_proj, value_proj, attention_mask=attention_mask)
+    with jax.named_scope("hitesy-scope-flux-attn-kernel"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-kernel"):
+      attn_output = self.attention_op.apply_attention(query_proj, key_proj, value_proj, attention_mask=attention_mask)
     context_attn_output = None
 
     if encoder_hidden_states is not None:
-      context_attn_output, attn_output = (
-          attn_output[:, : encoder_hidden_states.shape[1]],
-          attn_output[:, encoder_hidden_states.shape[1] :],
-      )
+      with jax.named_scope("hitesy-scope-flux-attn-out-proj"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-out-proj"):
+        context_attn_output, attn_output = (
+            attn_output[:, : encoder_hidden_states.shape[1]],
+            attn_output[:, encoder_hidden_states.shape[1] :],
+        )
 
-      attn_output = self.proj_attn(attn_output)
+        attn_output = self.proj_attn(attn_output)
 
-      context_attn_output = self.encoder_proj_attn(context_attn_output)
+        context_attn_output = self.encoder_proj_attn(context_attn_output)
 
     return attn_output, context_attn_output
 
