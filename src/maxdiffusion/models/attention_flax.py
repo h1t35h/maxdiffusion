@@ -238,6 +238,12 @@ def _select_flash_block_sizes(
   key_seq_len = _flash_sequence_length(key)
 
   q_max_block_size = 1024 if dtype == jnp.bfloat16 else 512
+  if query_seq_len > 0 and query_seq_len % q_max_block_size != 0:
+    for b in [768, 512, 384, 256, 128]:
+      if query_seq_len % b == 0:
+        q_max_block_size = b
+        break
+
   if key_seq_len != query_seq_len:
     kv_max_block_size = ((key_seq_len + 127) // 128) * 128
   else:
