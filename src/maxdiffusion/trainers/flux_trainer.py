@@ -83,10 +83,10 @@ class FluxTrainer(FluxCheckpointer):
     # self.pre_training_steps()
     # Load checkpoint - will load or create states
     max_logging.log(f"[hitesy-optim-config] Starting Flux Trainer on TPU v6e-8. per_device_batch_size: {self.config.per_device_batch_size}, total_train_batch_size: {self.total_train_batch_size}")
-    max_logging.log(f"[hitesy-optim-config] Model Architecture config: layers={self.config.num_layers}, single_layers={self.config.num_single_layers}, heads={self.config.num_attention_heads}, head_dim={self.config.attention_head_dim}")
-    max_logging.log(f"[hitesy-optim-config] Attention kernel: {self.config.attention_kernel}, Remat policy: {self.config.remat_policy}")
     with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       pipeline, params = self.load_checkpoint()
+      max_logging.log(f"[hitesy-optim-config] Model Architecture config: layers={pipeline.flux.config.num_layers}, single_layers={pipeline.flux.config.num_single_layers}, heads={pipeline.flux.config.num_attention_heads}, head_dim={pipeline.flux.config.attention_head_dim}")
+      max_logging.log(f"[hitesy-optim-config] Attention kernel: {pipeline.flux.config.attention_kernel}, Remat policy: {pipeline.flux.config.remat_policy}")
 
       # create train states
       train_states = {}
