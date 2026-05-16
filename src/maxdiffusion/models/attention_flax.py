@@ -1845,12 +1845,9 @@ class FlaxFluxAttention(nn.Module):
 
     with jax.named_scope("hitesy-scope-flux-attn-rope"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-rope"):
       image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+      image_rotary_emb = jnp.expand_dims(image_rotary_emb, axis=1)
 
-      query_proj = query_proj.swapaxes(1, 2)
-      key_proj = key_proj.swapaxes(1, 2)
       query_proj, key_proj = apply_rope(query_proj, key_proj, image_rotary_emb)
-      query_proj = query_proj.swapaxes(1, 2)
-      key_proj = key_proj.swapaxes(1, 2)
 
       query_proj = query_proj.reshape(B, -1, H * D)
       key_proj = key_proj.reshape(B, -1, H * D)
