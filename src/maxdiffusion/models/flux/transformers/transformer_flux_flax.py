@@ -31,7 +31,6 @@ from .... import common_types
 from ....common_types import BlockSizes
 from ....utils import BaseOutput
 from ...gradient_checkpoint import GradientCheckpointType
-from jax import checkpoint_policies as cp
 from jax.ad_checkpoint import checkpoint_name
 
 AxisNames = common_types.AxisNames
@@ -144,8 +143,8 @@ class FluxSingleTransformerBlock(nn.Module):
       k = self.attn.key_norm(k)
 
       if image_rotary_emb is not None:
-        image_rotary_emb_reordered = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
-        q, k = apply_rope(q, k, image_rotary_emb_reordered)
+        # image_rotary_emb is pre-reordered to [n, 1, d, 2, 2] upstream
+        q, k = apply_rope(q, k, image_rotary_emb)
 
       q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
       k = k.transpose(0, 2, 1, 3).reshape(k.shape[0], k.shape[2], -1)
@@ -413,10 +412,6 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(self.remat_policy)
 
-    # 2. Apply the policy to the Module classes
-    #RematDoubleBlock = self.gradient_checkpoint.apply_linen(FluxTransformerBlock)
-    #RematSingleBlock = self.gradient_checkpoint.apply_linen(FluxSingleTransformerBlock)
-
     # 1. Prepare the kwargs for the double blocks
     double_kwargs = {
         'dim': self.inner_dim,
@@ -433,10 +428,8 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         'qkv_bias': self.qkv_bias,
     }
 
-    # 2. Force strict checkpointing on the Double Wrapper
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("img_qkv_proj", "txt_qkv_proj"))
+    # 2. Apply the configured remat policy to the Double Wrapper
+    RemattedDoubleWrapper = self.gradient_checkpoint.apply_linen(ScannedDoubleBlockWrapper, prevent_cse=True)
 
     self.scanned_double_blocks = nn.scan(
         RemattedDoubleWrapper,
@@ -461,10 +454,8 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         'mlp_ratio': self.mlp_ratio,
     }
 
-    # 4. Force strict checkpointing on the Single Wrapper
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("lin1_norm_hidden_states", "lin2_hidden_states"))
+    # 4. Apply the configured remat policy to the Single Wrapper
+    RemattedSingleWrapper = self.gradient_checkpoint.apply_linen(ScannedSingleBlockWrapper, prevent_cse=True)
 
     self.scanned_single_blocks = nn.scan(
         RemattedSingleWrapper,
@@ -563,6 +554,10 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       ids = nn.with_logical_constraint(ids, ("activation_batch", None))
       image_rotary_emb = self.pe_embedder(ids)
       image_rotary_emb = nn.with_logical_constraint(image_rotary_emb, (None, None))
+      # Pre-compute RoPE reordering once here rather than inside every scan body
+      # (57 block iterations × 2 ops = 114 redundant reshapes eliminated)
+      image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+      image_rotary_emb = jnp.expand_dims(image_rotary_emb, axis=1)
 
     max_logging.log(f"[hitesy-optim-shapes-double-blocks-in] Entering scanned_double_blocks. hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}")
     with jax.named_scope("hitesy-scope-double-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-double-blocks"):

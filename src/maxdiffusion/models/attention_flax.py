@@ -28,7 +28,6 @@ from maxdiffusion.kernels.splash_attention import splash_attention_mask as tokam
 from maxdiffusion.kernels.splash_attention import splash_attention_kernel as tokamax_splash_attention_kernel
 from maxdiffusion.kernels.splash_attention import ring_attention_kernel as tokamax_ring_attention_kernel
 from maxdiffusion.kernels.splash_attention import base as tokamax_splash_base
-from einops import rearrange
 from .. import common_types, max_logging
 
 from ..kernels import custom_splash_attention as custom_splash
@@ -1844,9 +1843,7 @@ class FlaxFluxAttention(nn.Module):
         # value_proj = nn.with_logical_constraint(value_proj, self.value_axis_names)
 
     with jax.named_scope("hitesy-scope-flux-attn-rope"), jax.profiler.TraceAnnotation("hitesy-trace-flux-attn-rope"):
-      image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
-      image_rotary_emb = jnp.expand_dims(image_rotary_emb, axis=1)
-
+      # image_rotary_emb is pre-reordered to [n, 1, d, 2, 2] upstream (in FluxTransformer2DModel.__call__)
       query_proj, key_proj = apply_rope(query_proj, key_proj, image_rotary_emb)
 
       query_proj = query_proj.reshape(B, -1, H * D)
