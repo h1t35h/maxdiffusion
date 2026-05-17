@@ -84,15 +84,15 @@ class AdaLayerNormZero(nn.Module):
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(emb, 6, axis=-1)
     
     if self.norm_type == "layer_norm":
-      # Fused mathematical reduction loop
       mean = jnp.mean(x, axis=-1, keepdims=True)
-      variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+      centered = x - mean
+      variance = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
       inv_std = jax.lax.rsqrt(variance + 1e-6)
-      
-      x = (x - mean) * inv_std * (1.0 + scale_msa) + shift_msa
+
+      x = centered * inv_std * (1.0 + scale_msa) + shift_msa
     else:
       raise ValueError(f"Unsupported `norm_type` ({self.norm_type}) provided.")
-      
+
     return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -131,15 +131,15 @@ class AdaLayerNormZeroSingle(nn.Module):
     shift_msa, scale_msa, gate_msa = jnp.split(emb, 3, axis=-1)
     
     if self.norm_type == "layer_norm":
-      # Fused optimization math keeping exact pretrained weight compatibility
       mean = jnp.mean(x, axis=-1, keepdims=True)
-      variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+      centered = x - mean
+      variance = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
       inv_std = jax.lax.rsqrt(variance + 1e-6)
-      
-      x = (x - mean) * inv_std * (1.0 + scale_msa) + shift_msa
+
+      x = centered * inv_std * (1.0 + scale_msa) + shift_msa
     else:
       raise ValueError(f"Unsupported `norm_type` ({self.norm_type}) provided.")
-      
+
     return x, gate_msa
 
 

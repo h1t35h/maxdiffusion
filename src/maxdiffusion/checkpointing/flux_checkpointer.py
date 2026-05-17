@@ -214,6 +214,9 @@ class FluxCheckpointer(ABC):
           dtype=self.config.activations_dtype,
           weights_dtype=self.config.weights_dtype,
           precision=max_utils.get_precision(self.config),
+          remat_policy=self.config.remat_policy,
+          names_which_can_be_saved=tuple(self.config.names_which_can_be_saved),
+          names_which_can_be_offloaded=tuple(self.config.names_which_can_be_offloaded),
       )
       transformer_eval_params = transformer.init_weights(
           rngs=self.rng, max_sequence_length=self.config.max_sequence_length, eval_only=True
@@ -279,6 +282,9 @@ class FluxCheckpointer(ABC):
             weights_dtype=self.config.weights_dtype,
             precision=max_utils.get_precision(self.config),
             from_pt=self.config.from_pt,
+            remat_policy=self.config.remat_policy,
+            names_which_can_be_saved=tuple(self.config.names_which_can_be_saved),
+            names_which_can_be_offloaded=tuple(self.config.names_which_can_be_offloaded),
         )
 
         pipeline = FluxPipeline(

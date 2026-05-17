@@ -30,7 +30,6 @@ from .... import common_types
 from ....common_types import BlockSizes
 from ....utils import BaseOutput
 from ...gradient_checkpoint import GradientCheckpointType
-from jax import checkpoint_policies as cp
 from jax.ad_checkpoint import checkpoint_name
 
 AxisNames = common_types.AxisNames
@@ -117,22 +116,12 @@ class FluxSingleTransformerBlock(nn.Module):
 
   def __call__(self, hidden_states, temb, image_rotary_emb=None):
     residual = hidden_states
-    
-    # FIX: Constrain inputs using valid config parameters (None skips sequence length axis parsing)
-    hidden_states = nn.with_logical_constraint(
-        hidden_states, ("activation_batch", None, "mlp")
-    )
-    
+
     norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-    
+
     norm_hidden_states = self.linear1(norm_hidden_states)
     norm_hidden_states = checkpoint_name(norm_hidden_states, "lin1_norm_hidden_states")
 
-    # FIX: Enforce valid axis constraints prior to splitting the massive projection tensor
-    norm_hidden_states = nn.with_logical_constraint(
-        norm_hidden_states, ("activation_batch", None, "mlp")
-    )
-    
     qkv, mlp = jnp.split(norm_hidden_states, [3 * self.dim], axis=-1)
     
     B, L = hidden_states.shape[:2]
@@ -156,12 +145,7 @@ class FluxSingleTransformerBlock(nn.Module):
 
     # Re-combine streams smoothly
     attn_mlp = jnp.concatenate([attn_output, self.mlp_act(mlp)], axis=2)
-    
-    # FIX: Enforce a clean exit layout before executing linear2
-    attn_mlp = nn.with_logical_constraint(
-        attn_mlp, ("activation_batch", None, "mlp")
-    )
-    
+
     hidden_states = self.linear2(attn_mlp)
     
     hidden_states = gate * hidden_states
@@ -275,13 +259,14 @@ class FluxTransformerBlock(nn.Module):
     attn_output = gate_msa * attn_output
     hidden_states = hidden_states + attn_output
     
-    # Fully fused LayerNorm + scale_mlp + shift_mlp compilation block
+    # LayerNorm fused with scale/shift; cache the centered tensor so it isn't
+    # materialized twice.
     img_mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
-    img_var = jnp.mean(jnp.square(hidden_states - img_mean), axis=-1, keepdims=True)
+    img_centered = hidden_states - img_mean
+    img_var = jnp.mean(jnp.square(img_centered), axis=-1, keepdims=True)
     img_inv_std = jax.lax.rsqrt(img_var + self.eps)
-    
-    norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
-    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", None, "mlp"))
+
+    norm_hidden_states = img_centered * img_inv_std * (1 + scale_mlp) + shift_mlp
 
     ff_output = self.img_mlp(norm_hidden_states)
     hidden_states = hidden_states + gate_mlp * ff_output
@@ -290,19 +275,19 @@ class FluxTransformerBlock(nn.Module):
     context_attn_output = c_gate_msa * context_attn_output
     encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-    # Fully fused LayerNorm + c_scale_mlp + c_shift_mlp compilation block
     txt_mean = jnp.mean(encoder_hidden_states, axis=-1, keepdims=True)
-    txt_var = jnp.mean(jnp.square(encoder_hidden_states - txt_mean), axis=-1, keepdims=True)
+    txt_centered = encoder_hidden_states - txt_mean
+    txt_var = jnp.mean(jnp.square(txt_centered), axis=-1, keepdims=True)
     txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
 
-    norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
-    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", None, "mlp"))
+    norm_encoder_hidden_states = txt_centered * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
 
     context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
     encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
     
-    # Safe numerical clipping limits for half precision math execution
-    if encoder_hidden_states.dtype == jnp.float16 or encoder_hidden_states.dtype == jnp.bfloat16:
+    # fp16 has max ~65504 and benefits from a guard; bf16's range is ~3.4e38,
+    # so clipping bf16 to fp16's range silently distorts large activations.
+    if encoder_hidden_states.dtype == jnp.float16:
       encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
       hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -370,6 +355,8 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   attention_kernel: str = "dot_product"
   eps: float = 1e-6
   remat_policy: str = "None"
+  names_which_can_be_saved: Tuple[str, ...] = ()
+  names_which_can_be_offloaded: Tuple[str, ...] = ()
 
   def setup(self):
     self.out_channels = self.in_channels
@@ -388,28 +375,27 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         weights_dtype=self.weights_dtype,
         precision=self.precision,
     )
+    # Kernels shard the in-axis on `embed` so under FSDP the params are
+    # sharded across the fsdp mesh axis. The previous (None, "mlp") layout
+    # resolved to fully-replicated under fsdp-only configs (mlp -> tensor=1).
     self.txt_in = nn.Dense(
         self.inner_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, "mlp")),
-        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, ("mlp",)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
         precision=self.precision,
     )
     self.img_in = nn.Dense(
         self.inner_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, "mlp")),
-        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, ("mlp",)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
         precision=self.precision,
     )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(self.remat_policy)
-
-    # 2. Apply the policy to the Module classes
-    #RematDoubleBlock = self.gradient_checkpoint.apply_linen(FluxTransformerBlock)
-    #RematSingleBlock = self.gradient_checkpoint.apply_linen(FluxSingleTransformerBlock)
 
     # 1. Prepare the kwargs for the double blocks
     double_kwargs = {
@@ -427,10 +413,15 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         'qkv_bias': self.qkv_bias,
     }
 
-    # 2. Force strict checkpointing on the Double Wrapper
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("img_qkv_proj", "txt_qkv_proj"))
+    # 2. Apply the configured gradient checkpoint policy to the scanned wrapper.
+    # Previous code used cp.save_any_names_but_these(...), which is the inverse of
+    # what's wanted — it kept ~all activations and only recomputed two named ones.
+    RemattedDoubleWrapper = self.gradient_checkpoint.apply_linen(
+        ScannedDoubleBlockWrapper,
+        names_which_can_be_saved=list(self.names_which_can_be_saved),
+        names_which_can_be_offloaded=list(self.names_which_can_be_offloaded),
+        prevent_cse=True,
+    )
 
     self.scanned_double_blocks = nn.scan(
         RemattedDoubleWrapper,
@@ -455,10 +446,13 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         'mlp_ratio': self.mlp_ratio,
     }
 
-    # 4. Force strict checkpointing on the Single Wrapper
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("lin1_norm_hidden_states", "lin2_hidden_states"))
+    # 4. Apply the configured gradient checkpoint policy to the single wrapper.
+    RemattedSingleWrapper = self.gradient_checkpoint.apply_linen(
+        ScannedSingleBlockWrapper,
+        names_which_can_be_saved=list(self.names_which_can_be_saved),
+        names_which_can_be_offloaded=list(self.names_which_can_be_offloaded),
+        prevent_cse=True,
+    )
 
     self.scanned_single_blocks = nn.scan(
         RemattedSingleWrapper,
@@ -479,7 +473,7 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
 
     self.proj_out = nn.Dense(
         self.patch_size**2 * self.out_channels,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", None)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
         bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
