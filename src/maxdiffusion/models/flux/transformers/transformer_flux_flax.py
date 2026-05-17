@@ -24,7 +24,7 @@ from einops import repeat, rearrange
 from ....configuration_utils import ConfigMixin, flax_register_to_config
 from ...modeling_flax_utils import FlaxModelMixin
 from ...normalization_flax import AdaLayerNormZeroSingle, AdaLayerNormContinuous, AdaLayerNormZero
-from ...attention_flax import FlaxFluxAttention, apply_rope
+from ...attention_flax import FlaxFluxAttention, FlaxFluxAttentionSingle, apply_rope
 from ...embeddings_flax import (FluxPosEmbed, CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings)
 from .... import common_types
 from ....common_types import BlockSizes
@@ -103,7 +103,7 @@ class FluxSingleTransformerBlock(nn.Module):
         param_dtype=self.weights_dtype,
         precision=self.precision,
     )
-    self.attn = FlaxFluxAttention(
+    self.attn = FlaxFluxAttentionSingle(
         query_dim=self.dim,
         heads=self.num_attention_heads,
         dim_head=self.attention_head_dim,

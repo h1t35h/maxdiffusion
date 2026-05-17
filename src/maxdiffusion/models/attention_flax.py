@@ -1690,6 +1690,62 @@ class FlaxWanAttention(nnx.Module):
     return hidden_states
 
 
+class FlaxFluxAttentionSingle(nn.Module):
+  """Slim attention container for FluxSingleTransformerBlock.
+
+  The single-block path does its own QKV projection (inside linear1) and its
+  own output projection (inside linear2), so it only needs the attention op
+  plus query/key RMSNorms. Using the full FlaxFluxAttention here would leave
+  ~75M params per block unused but still updated by the optimizer.
+
+  Keeps the `attn.query_norm` / `attn.key_norm` parameter paths that
+  load_flow_model expects.
+  """
+
+  query_dim: int
+  heads: int = 8
+  dim_head: int = 64
+  attention_kernel: str = "dot_product"
+  flash_min_seq_length: int = 4096
+  flash_block_sizes: BlockSizes = None
+  mesh: jax.sharding.Mesh = None
+  dtype: jnp.dtype = jnp.float32
+  weights_dtype: jnp.dtype = jnp.float32
+  precision: jax.lax.Precision = None
+  use_memory_efficient_attention: bool = False
+  split_head_dim: bool = False
+
+  def setup(self):
+    if self.attention_kernel in {"flash", "cudnn_flash_te"} and self.mesh is None:
+      raise ValueError(f"The flash attention kernel requires a value for mesh, but mesh is {self.mesh}")
+    scale = self.dim_head**-0.5
+
+    self.attention_op = AttentionOp(
+        mesh=self.mesh,
+        attention_kernel=self.attention_kernel,
+        scale=scale,
+        heads=self.heads,
+        dim_head=self.dim_head,
+        flash_min_seq_length=self.flash_min_seq_length,
+        use_memory_efficient_attention=self.use_memory_efficient_attention,
+        split_head_dim=self.split_head_dim,
+        flash_block_sizes=self.flash_block_sizes,
+        dtype=self.dtype,
+        float32_qk_product=False,
+    )
+
+    self.query_norm = nn.RMSNorm(
+        dtype=self.dtype,
+        scale_init=nn.with_logical_partitioning(nn.initializers.ones, ("heads",)),
+        param_dtype=self.weights_dtype,
+    )
+    self.key_norm = nn.RMSNorm(
+        dtype=self.dtype,
+        scale_init=nn.with_logical_partitioning(nn.initializers.ones, ("heads",)),
+        param_dtype=self.weights_dtype,
+    )
+
+
 class FlaxFluxAttention(nn.Module):
   query_dim: int
   heads: int = 8
