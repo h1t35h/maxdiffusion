@@ -441,6 +441,11 @@ class FluxTrainer(FluxCheckpointer):
           with self.mesh:
             flux_state, train_metric, train_rngs = p_train_step(flux_state, example_batch, train_rngs)
 
+      # Force completion of the step before measuring wall time. Without this,
+      # JAX's async dispatch makes per-step measurements at short run lengths
+      # reflect dispatch overhead, not TPU compute.
+      jax.block_until_ready(train_metric["scalar"]["learning/loss"])
+
       samples_count = self.total_train_batch_size * (step + 1)
       new_time = datetime.datetime.now()
 
