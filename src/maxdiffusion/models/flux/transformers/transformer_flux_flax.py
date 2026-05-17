@@ -143,7 +143,7 @@ class FluxSingleTransformerBlock(nn.Module):
       k = self.attn.key_norm(k)
 
       if image_rotary_emb is not None:
-        # image_rotary_emb is pre-reordered to [n, 1, d, 2, 2] upstream
+        # image_rotary_emb is pre-reordered to [n, d, 2, 2] upstream (rearrange only, no expand_dims)
         q, k = apply_rope(q, k, image_rotary_emb)
 
       q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
@@ -554,25 +554,28 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       ids = nn.with_logical_constraint(ids, ("activation_batch", None))
       image_rotary_emb = self.pe_embedder(ids)
       image_rotary_emb = nn.with_logical_constraint(image_rotary_emb, (None, None))
-      # Pre-compute RoPE reordering once here rather than inside every scan body
-      # (57 block iterations × 2 ops = 114 redundant reshapes eliminated)
-      image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
-      image_rotary_emb = jnp.expand_dims(image_rotary_emb, axis=1)
+      # Precompute rearrange once here, not inside each of the 57 scan bodies.
+      # Double blocks (FlaxFluxAttention) use q in [B,L,H,D] layout → need expand_dims(axis=1)
+      # for head broadcasting → shape [n, 1, d, 2, 2].
+      # Single blocks use q in [B,H,L,D] layout → the rearranged form [n, d, 2, 2] broadcasts
+      # naturally, so no expand_dims needed.
+      image_rotary_emb_reordered = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+      image_rotary_emb_for_double = jnp.expand_dims(image_rotary_emb_reordered, axis=1)
 
     max_logging.log(f"[hitesy-optim-shapes-double-blocks-in] Entering scanned_double_blocks. hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}")
     with jax.named_scope("hitesy-scope-double-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-double-blocks"):
-      carry = (hidden_states, encoder_hidden_states, temb, image_rotary_emb)
+      carry = (hidden_states, encoder_hidden_states, temb, image_rotary_emb_for_double)
       carry, _ = self.scanned_double_blocks(carry, None)
       hidden_states, encoder_hidden_states, _, _ = carry
 
     with jax.named_scope("hitesy-scope-concat-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-concat-blocks"):
       hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
       hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "activation_embed"))
-    
+
     max_logging.log(f"[hitesy-optim-shapes-single-blocks-in] Entering scanned_single_blocks. concatenated hidden_states={hidden_states.shape}")
     with jax.named_scope("hitesy-scope-single-blocks"), jax.profiler.TraceAnnotation("hitesy-trace-single-blocks"):
       # Execute the 38 Single Blocks
-      carry = (hidden_states, temb, image_rotary_emb)
+      carry = (hidden_states, temb, image_rotary_emb_reordered)
       carry, _ = self.scanned_single_blocks(carry, None)
       hidden_states, _, _ = carry
 
