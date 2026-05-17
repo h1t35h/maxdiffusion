@@ -1818,7 +1818,7 @@ class FlaxFluxAttention(nn.Module):
       qkv_proj = checkpoint_name(qkv_proj, "img_qkv_proj")
       
       qkv_proj = qkv_proj.reshape(B, L, 3, H, D)
-      query_proj, key_proj, value_proj = [qkv_proj[:, :, i, ...] for i in range(3)]
+      query_proj, key_proj, value_proj = qkv_proj[:, :, 0], qkv_proj[:, :, 1], qkv_proj[:, :, 2]
 
       query_proj = self.query_norm(query_proj)
       key_proj = self.key_norm(key_proj)
@@ -1829,7 +1829,7 @@ class FlaxFluxAttention(nn.Module):
         encoder_qkv_proj = self.encoder_qkv(encoder_hidden_states)
         encoder_qkv_proj = checkpoint_name(encoder_qkv_proj, "txt_qkv_proj")
         encoder_qkv_proj = encoder_qkv_proj.reshape(B_enc, L_txt, 3, H, D)
-        enc_query_proj, enc_key_proj, enc_value_proj = [encoder_qkv_proj[:, :, i, ...] for i in range(3)]
+        enc_query_proj, enc_key_proj, enc_value_proj = encoder_qkv_proj[:, :, 0], encoder_qkv_proj[:, :, 1], encoder_qkv_proj[:, :, 2]
 
         encoder_query_proj = self.encoder_query_norm(enc_query_proj)
         encoder_key_proj = self.encoder_key_norm(enc_key_proj)

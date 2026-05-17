@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from typing import Tuple
+import functools
 import jax
 from maxdiffusion import max_logging
 import math
@@ -95,7 +96,7 @@ class FluxSingleTransformerBlock(nn.Module):
         precision=self.precision,
     )
 
-    self.mlp_act = nn.gelu
+    self.mlp_act = functools.partial(nn.gelu, approximate=True)
     self.linear2 = nn.Dense(
         self.dim,
         kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
@@ -134,10 +135,16 @@ class FluxSingleTransformerBlock(nn.Module):
     
     with jax.named_scope("hitesy-scope-single-attn"), jax.profiler.TraceAnnotation("hitesy-trace-single-attn"):
       B, L = hidden_states.shape[:2]
-      H, D, K = self.num_attention_heads, qkv.shape[-1] // (self.num_attention_heads * 3), 3
-      
-      qkv_proj = qkv.reshape(B, L, K, H, D).transpose(2, 0, 3, 1, 4)
-      q, k, v = qkv_proj
+      H = self.num_attention_heads
+      D = qkv.shape[-1] // (H * 3)
+
+      # Split qkv without the round-trip transpose for v.
+      # q/k need [B, H, L, D] for RMSNorm and RoPE; reshape them via a single transpose.
+      # v is not normed or RoPE'd, so go straight to [B, L, H*D].
+      qkv_split = qkv.reshape(B, L, 3, H, D)
+      q = qkv_split[:, :, 0].transpose(0, 2, 1, 3)  # [B, H, L, D]
+      k = qkv_split[:, :, 1].transpose(0, 2, 1, 3)  # [B, H, L, D]
+      v = qkv_split[:, :, 2].reshape(B, L, -1)       # [B, L, H*D] — skips needless round-trip
 
       q = self.attn.query_norm(q)
       k = self.attn.key_norm(k)
@@ -146,9 +153,8 @@ class FluxSingleTransformerBlock(nn.Module):
         # image_rotary_emb is pre-reordered to [n, d, 2, 2] upstream (rearrange only, no expand_dims)
         q, k = apply_rope(q, k, image_rotary_emb)
 
-      q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
-      k = k.transpose(0, 2, 1, 3).reshape(k.shape[0], k.shape[2], -1)
-      v = v.transpose(0, 2, 1, 3).reshape(v.shape[0], v.shape[2], -1)
+      q = q.transpose(0, 2, 1, 3).reshape(B, L, -1)
+      k = k.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
       attn_output = self.attn.attention_op.apply_attention(q, k, v)
 
@@ -209,6 +215,8 @@ class FluxTransformerBlock(nn.Module):
     # REMOVED: self.img_norm2 and self.txt_norm2 completely to stop HBM memory spilling.
     # The mathematical reductions are handled natively below.
 
+    _approx_gelu = functools.partial(nn.gelu, approximate=True)
+
     self.img_mlp = nn.Sequential([
         nn.Dense(
             int(self.dim * self.mlp_ratio),
@@ -219,7 +227,7 @@ class FluxTransformerBlock(nn.Module):
             param_dtype=self.weights_dtype,
             precision=self.precision,
         ),
-        nn.gelu,
+        _approx_gelu,
         nn.Dense(
             self.dim,
             use_bias=True,
@@ -241,7 +249,7 @@ class FluxTransformerBlock(nn.Module):
             param_dtype=self.weights_dtype,
             precision=self.precision,
         ),
-        nn.gelu,
+        _approx_gelu,
         nn.Dense(
             self.dim,
             use_bias=True,
