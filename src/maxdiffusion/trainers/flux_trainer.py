@@ -460,7 +460,7 @@ class FluxTrainer(FluxCheckpointer):
 
       if max_utils.profiler_enabled(self.config) and step == last_profiling_step:
         if self._profiler is not None:
-          self._profiler.stop()
+          self._profiler.__exit__(None, None, None)
 
     train_states[FLUX_STATE_KEY] = flux_state
     if len(times) > 0:
