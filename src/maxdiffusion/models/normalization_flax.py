@@ -42,11 +42,19 @@ class AdaLayerNormContinuous(nn.Module):
         param_dtype=self.weights_dtype,
         precision=self.precision,
     )(nn.silu(conditioning_embedding))
-    shift, scale = jnp.split(emb, 2, axis=1)
-    shift = nn.with_logical_constraint(shift, ("activation_batch", "activation_embed"))
-    scale = nn.with_logical_constraint(scale, ("activation_batch", "activation_embed"))
+    
+    # 1. Expand layout to 3D
+    emb = emb[:, None, :]
+    
+    # 2. Apply 3D logical constraint to match our FSDP/Tensor parallelism rules
+    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "mlp"))
+    
+    # 3. Split along the sharded feature dimension
+    shift, scale = jnp.split(emb, 2, axis=-1)
+    
+    # 4. LayerNorm and aligned elementwise scale/shift
     x = nn.LayerNorm(epsilon=self.eps, use_bias=self.elementwise_affine, use_scale=self.elementwise_affine)(x)
-    x = (1 + scale[:, None, :]) * x + shift[:, None, :]
+    x = (1 + scale) * x + shift
     return x
 
 
