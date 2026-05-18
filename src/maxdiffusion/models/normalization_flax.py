@@ -43,16 +43,20 @@ class AdaLayerNormContinuous(nn.Module):
         precision=self.precision,
     )(nn.silu(conditioning_embedding))
     
-    # 1. Expand layout to 3D
+    # 1. Apply 2D logical constraint using 'embed' to isolate feature resharding in 2D
+    emb = nn.with_logical_constraint(emb, ("activation_batch", "embed"))
+
+    # 2. Expand layout to 3D
     emb = emb[:, None, :]
-    
-    # 2. Apply 3D logical constraint using 'embed' to align with hidden_states sharding
-    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "embed"))
     
     # 3. Split along the sharded feature dimension
     shift, scale = jnp.split(emb, 2, axis=-1)
     
-    # 4. LayerNorm and aligned elementwise scale/shift
+    # 4. Explicitly constrain split outputs to prevent any compiler resharding fallback
+    shift = nn.with_logical_constraint(shift, ("activation_batch", None, "embed"))
+    scale = nn.with_logical_constraint(scale, ("activation_batch", None, "embed"))
+    
+    # 5. LayerNorm and aligned elementwise scale/shift
     x = nn.LayerNorm(epsilon=self.eps, use_bias=self.elementwise_affine, use_scale=self.elementwise_affine)(x)
     x = (1 + scale) * x + shift
     return x
