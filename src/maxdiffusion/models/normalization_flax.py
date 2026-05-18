@@ -33,30 +33,21 @@ class AdaLayerNormContinuous(nn.Module):
   @nn.compact
   def __call__(self, x, conditioning_embedding):
     assert self.norm_type == "layer_norm"
+    # Dense output is split immediately into (shift, scale); leaving the output
+    # dim unsharded means the split is a free local op rather than forcing an
+    # all-gather along the tensor axis (chunk size < per-device shard).
     emb = nn.Dense(
         self.embedding_dim * 2,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, ("mlp",)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         use_bias=self.bias,
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
         precision=self.precision,
     )(nn.silu(conditioning_embedding))
-    
-    # 1. Apply 2D logical constraint using 'embed' to isolate feature resharding in 2D
-    emb = nn.with_logical_constraint(emb, ("activation_batch", "embed"))
-
-    # 2. Expand layout to 3D
+    emb = nn.with_logical_constraint(emb, ("activation_batch", None))
     emb = emb[:, None, :]
-    
-    # 3. Split along the sharded feature dimension
     shift, scale = jnp.split(emb, 2, axis=-1)
-    
-    # 4. Explicitly constrain split outputs to prevent any compiler resharding fallback
-    shift = nn.with_logical_constraint(shift, ("activation_batch", None, "embed"))
-    scale = nn.with_logical_constraint(scale, ("activation_batch", None, "embed"))
-    
-    # 5. LayerNorm and aligned elementwise scale/shift
     x = nn.LayerNorm(epsilon=self.eps, use_bias=self.elementwise_affine, use_scale=self.elementwise_affine)(x)
     x = (1 + scale) * x + shift
     return x
@@ -74,25 +65,22 @@ class AdaLayerNormZero(nn.Module):
   def __call__(self, x, emb):
     emb = nn.silu(emb)
     
-    # Pretrained Flux checks: The dual block variant projects to 6 * dim 
-    # to unpack: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+    # Project to 6 * dim, split into (shift_msa, scale_msa, gate_msa, shift_mlp,
+    # scale_mlp, gate_mlp). Output dim is left unsharded — sharding on "mlp" then
+    # splitting into chunks smaller than the per-device shard forces an
+    # all-gather along the tensor axis.
     emb = nn.Dense(
         6 * self.embedding_dim,
         use_bias=self.bias,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, ("mlp",)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
         precision=self.precision,
         name="lin",
     )(emb)
-    
+    emb = nn.with_logical_constraint(emb, ("activation_batch", None))
     emb = emb[:, None, :]
-    
-    # Explicit MaxDiffusion 3D axis alignment mapping to your 'mlp' layout rule
-    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "mlp"))
-    
-    # Slicing the 6 chunks safely within your fsdp:8, tensor:1 configuration
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(emb, 6, axis=-1)
     
     if self.norm_type == "layer_norm":
@@ -120,26 +108,20 @@ class AdaLayerNormZeroSingle(nn.Module):
   def __call__(self, x, emb):
     emb = nn.silu(emb)
     
-    # Matches your config layout precisely
+    # See AdaLayerNormZero — output is split into 3, so leave the output dim
+    # unsharded to keep the split as a free local op.
     emb = nn.Dense(
         3 * self.embedding_dim,
         use_bias=self.bias,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, ("mlp",)),
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", None)),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
         dtype=self.dtype,
         param_dtype=self.weights_dtype,
         precision=self.precision,
         name="lin",
     )(emb)
-    
-    # 1. Expand layout safely to a 3D Tensor
+    emb = nn.with_logical_constraint(emb, ("activation_batch", None))
     emb = emb[:, None, :]
-    
-    # 2. FIX: Apply verified MaxDiffusion logical rules to match the 3D footprint
-    # We map the channels to 'mlp' because that matches the output layout dimension of the dense layer
-    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "mlp"))
-    
-    # 3. Slicing now happens safely within known sharding rules
     shift_msa, scale_msa, gate_msa = jnp.split(emb, 3, axis=-1)
     
     if self.norm_type == "layer_norm":

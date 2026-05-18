@@ -83,8 +83,11 @@ class MlpAndOutputBlock(nn.Module):
   def __call__(self, x, attn_output, gate, residual):
     mlp = self.lin_mlp(x)
     attn_mlp = jnp.concatenate([attn_output, self.mlp_act(mlp)], axis=2)
+    # Keep the wide intermediate sharded on all three parallel axes — batch by
+    # data*fsdp, length by context, hidden by tensor. Without context on length
+    # this materializes a full-seq tensor.
     attn_mlp = nn.with_logical_constraint(
-        attn_mlp, ("activation_batch", None, "mlp")
+        attn_mlp, ("activation_batch", "activation_length", "mlp")
     )
     hidden_states = self.linear2(attn_mlp)
     hidden_states = checkpoint_name(hidden_states, "lin2_hidden_states")
@@ -161,17 +164,24 @@ class FluxSingleTransformerBlock(nn.Module):
 
   def __call__(self, hidden_states, temb, image_rotary_emb=None):
     residual = hidden_states
-    
-    # FIX: Constrain inputs using valid config parameters (None skips sequence length axis parsing)
+
+    # Inter-block activation: batch sharded by data*fsdp, length by context,
+    # feature dim replicated. Putting the feature dim on "mlp" (tensor) here
+    # mismatches the Dense kernel's input dim (which is on "embed"=fsdp) and
+    # causes XLA to all-gather the activation across data*fsdp*context, blowing
+    # up memory by ~128x.
     hidden_states = nn.with_logical_constraint(
-        hidden_states, ("activation_batch", None, "mlp")
+        hidden_states, ("activation_batch", "activation_length", None)
     )
-    
+
     norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-    
+
     qkv = self.lin_qkv(norm_hidden_states)
     qkv = checkpoint_name(qkv, "lin1_norm_hidden_states")
-    qkv = nn.with_logical_constraint(qkv, ("activation_batch", None, "mlp"))
+    # qkv is reshaped to (B, L, 3, H, D); "mlp" and "heads" both map to the
+    # tensor axis, so sharding the 3*H*D combined dim leaves H tensor-sharded
+    # after the reshape.
+    qkv = nn.with_logical_constraint(qkv, ("activation_batch", "activation_length", "mlp"))
     
     B, L = hidden_states.shape[:2]
     H, D, K = self.num_attention_heads, qkv.shape[-1] // (self.num_attention_heads * 3), 3
@@ -291,9 +301,13 @@ class FluxTransformerBlock(nn.Module):
     ])
 
   def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None):
-    # Enforce active partitioning based on your FSDP setup config
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", None, "mlp"))
-    encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", None, "mlp"))
+    # Inter-block activations: shard batch by data*fsdp and length by context,
+    # leave the feature dim replicated. The Dense kernels inside use input dim
+    # on "embed"=fsdp; sharding the activation's feature dim on "mlp"=tensor
+    # would mismatch the contract and force a full all-gather across batch and
+    # length axes (the cause of the [B_global, L_global, mlp/tensor] OOM).
+    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", None))
+    encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", "activation_length", None))
 
     # 1. First Adaptive Normalization Pass
     norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.img_norm1(hidden_states, emb=temb)
@@ -318,7 +332,7 @@ class FluxTransformerBlock(nn.Module):
     img_inv_std = jax.lax.rsqrt(img_var + self.eps)
     
     norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
-    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", None, "mlp"))
+    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", "activation_length", None))
 
     ff_output = self.img_mlp(norm_hidden_states)
     hidden_states = hidden_states + gate_mlp * ff_output
@@ -333,7 +347,7 @@ class FluxTransformerBlock(nn.Module):
     txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
 
     norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
-    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", None, "mlp"))
+    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", "activation_length", None))
 
     context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
     encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
@@ -613,7 +627,7 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
     hidden_states, encoder_hidden_states, _, _ = carry
 
     hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "activation_embed"))
+    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", None))
     
     # Execute the 38 Single Blocks
     carry = (hidden_states, temb, image_rotary_emb)
