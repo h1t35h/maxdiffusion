@@ -473,8 +473,7 @@ class FluxTrainer(FluxCheckpointer):
 
 
 def _train_step(flux_state, batch, train_rng, guidance_vec, pipeline, scheduler, config):
-  _, gen_dummy_rng = jax.random.split(train_rng)
-  sample_rng, timestep_bias_rng, new_train_rng = jax.random.split(gen_dummy_rng, 3)
+  noise_rng, timestep_rng, new_train_rng = jax.random.split(train_rng, 3)
   state_params = {FLUX_STATE_KEY: flux_state.params}
 
   def compute_loss(state_params):
@@ -485,7 +484,6 @@ def _train_step(flux_state, batch, train_rng, guidance_vec, pipeline, scheduler,
     img_ids = batch["img_ids"]
 
     # Sample noise that we'll add to the latents
-    noise_rng, timestep_rng = jax.random.split(sample_rng)
     noise = jax.random.normal(
         key=noise_rng,
         shape=latents.shape,
