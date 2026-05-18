@@ -92,7 +92,7 @@ def get_kernel_name(is_mqa: bool, save_residuals: bool, is_segmented: bool, phas
   residuals = "_residuals" if save_residuals else "_no_residuals"
   attention_type = "mqa" if is_mqa else "mha"
   segments = "_segmented" if is_segmented else ""
-  return f"splash_{attention_type}_{phase}{segments}{residuals}"
+  return f"tokamax_splash_{attention_type}_{phase}{segments}{residuals}"
 
 
 # Splash attention implementation
