@@ -46,8 +46,8 @@ class AdaLayerNormContinuous(nn.Module):
     # 1. Expand layout to 3D
     emb = emb[:, None, :]
     
-    # 2. Apply 3D logical constraint to match our FSDP/Tensor parallelism rules
-    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "mlp"))
+    # 2. Apply 3D logical constraint using 'embed' to align with hidden_states sharding
+    emb = nn.with_logical_constraint(emb, ("activation_batch", None, "embed"))
     
     # 3. Split along the sharded feature dimension
     shift, scale = jnp.split(emb, 2, axis=-1)
