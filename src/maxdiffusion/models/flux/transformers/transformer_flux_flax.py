@@ -53,6 +53,51 @@ class Transformer2DModelOutput(BaseOutput):
   sample: jnp.ndarray
 
 
+class FluxFeedForward(nn.Module):
+  """Replaces nn.Sequential([Dense_in, gelu, Dense_out]) so we can pin a
+  with_logical_constraint on the wide gelu intermediate. Without the constraint
+  XLA is free to drop batch/length sharding on the (B, L, mlp_hidden)
+  intermediate during backward weight-gradient computation, materializing
+  ~52 GB per device. Child param names (layers_0, layers_2) match nn.Sequential
+  so the from_pt loader (modeling_flax_pytorch_utils._img_mlp_0 etc.) still
+  resolves.
+  """
+
+  dim: int
+  mlp_ratio: float
+  dtype: jnp.dtype
+  weights_dtype: jnp.dtype
+  precision: jax.lax.Precision = None
+
+  def setup(self):
+    self.layers_0 = nn.Dense(
+        int(self.dim * self.mlp_ratio),
+        use_bias=True,
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+    self.layers_2 = nn.Dense(
+        self.dim,
+        use_bias=True,
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+
+  def __call__(self, x):
+    mid = self.layers_0(x)
+    mid = nn.gelu(mid)
+    mid = nn.with_logical_constraint(
+        mid, ("activation_batch", "activation_length", "mlp")
+    )
+    return self.layers_2(mid)
+
+
 class MlpAndOutputBlock(nn.Module):
   dim: int
   mlp_ratio: float = 4.0
@@ -82,10 +127,19 @@ class MlpAndOutputBlock(nn.Module):
 
   def __call__(self, x, attn_output, gate, residual):
     mlp = self.lin_mlp(x)
+    # Pin the wide MLP intermediate before concat, otherwise XLA can lose the
+    # batch/length sharding through the gelu+concat and materialize a full
+    # (B_global, L_global, mlp_hidden/tensor) tensor.
+    mlp = nn.with_logical_constraint(
+        mlp, ("activation_batch", "activation_length", "mlp")
+    )
+    # Constrain attn_output too — the attention output's natural sharding
+    # conflicts on the fsdp axis (BATCH wants data*fsdp, HEAD wants fsdp), and
+    # XLA may have replicated batch to resolve it.
+    attn_output = nn.with_logical_constraint(
+        attn_output, ("activation_batch", "activation_length", None)
+    )
     attn_mlp = jnp.concatenate([attn_output, self.mlp_act(mlp)], axis=2)
-    # Keep the wide intermediate sharded on all three parallel axes — batch by
-    # data*fsdp, length by context, hidden by tensor. Without context on length
-    # this materializes a full-seq tensor.
     attn_mlp = nn.with_logical_constraint(
         attn_mlp, ("activation_batch", "activation_length", "mlp")
     )
@@ -206,6 +260,12 @@ class FluxSingleTransformerBlock(nn.Module):
 
     attn_output = self.attn.attention_op.apply_attention(q, k, v)
     attn_output = checkpoint_name(attn_output, "attn_output")
+    # Pin attn_output before it enters MlpAndOutputBlock — the attention output
+    # has a fsdp-axis conflict (BATCH vs HEAD) and may have lost batch
+    # sharding, which would propagate into the wide concat intermediate.
+    attn_output = nn.with_logical_constraint(
+        attn_output, ("activation_batch", "activation_length", None)
+    )
 
     hidden_states = self.mlp_and_out(norm_hidden_states, attn_output, gate, residual)
     
@@ -256,49 +316,20 @@ class FluxTransformerBlock(nn.Module):
     # REMOVED: self.img_norm2 and self.txt_norm2 completely to stop HBM memory spilling.
     # The mathematical reductions are handled natively below.
 
-    self.img_mlp = nn.Sequential([
-        nn.Dense(
-            int(self.dim * self.mlp_ratio),
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-        nn.gelu,
-        nn.Dense(
-            self.dim,
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-    ])
-
-    self.txt_mlp = nn.Sequential([
-        nn.Dense(
-            int(self.dim * self.mlp_ratio),
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-        nn.gelu,
-        nn.Dense(
-            self.dim,
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-    ])
+    self.img_mlp = FluxFeedForward(
+        dim=self.dim,
+        mlp_ratio=self.mlp_ratio,
+        dtype=self.dtype,
+        weights_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+    self.txt_mlp = FluxFeedForward(
+        dim=self.dim,
+        mlp_ratio=self.mlp_ratio,
+        dtype=self.dtype,
+        weights_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
 
   def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None):
     # Inter-block activations: shard batch by data*fsdp and length by context,
@@ -321,10 +352,23 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states=norm_encoder_hidden_states,
         image_rotary_emb=image_rotary_emb,
     )
+    # Re-pin attention outputs. Inside FlaxFluxAttention they're constrained to
+    # (BATCH, LENGTH, HEAD), where HEAD->fsdp and BATCH->[data,fsdp] both want
+    # the same physical axis. XLA's resolution can leave batch replicated,
+    # which then drags batch all the way through img_mlp's intermediate.
+    attn_output = nn.with_logical_constraint(
+        attn_output, ("activation_batch", "activation_length", None)
+    )
+    context_attn_output = nn.with_logical_constraint(
+        context_attn_output, ("activation_batch", "activation_length", None)
+    )
 
     # --- IMAGE STREAM OPTIMIZATION (img_norm2) ---
     attn_output = gate_msa * attn_output
     hidden_states = hidden_states + attn_output
+    hidden_states = nn.with_logical_constraint(
+        hidden_states, ("activation_batch", "activation_length", None)
+    )
     
     # Fully fused LayerNorm + scale_mlp + shift_mlp compilation block
     img_mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
@@ -340,6 +384,9 @@ class FluxTransformerBlock(nn.Module):
     # --- TEXT STREAM OPTIMIZATION (txt_norm2) ---
     context_attn_output = c_gate_msa * context_attn_output
     encoder_hidden_states = encoder_hidden_states + context_attn_output
+    encoder_hidden_states = nn.with_logical_constraint(
+        encoder_hidden_states, ("activation_batch", "activation_length", None)
+    )
 
     # Fully fused LayerNorm + c_scale_mlp + c_shift_mlp compilation block
     txt_mean = jnp.mean(encoder_hidden_states, axis=-1, keepdims=True)
