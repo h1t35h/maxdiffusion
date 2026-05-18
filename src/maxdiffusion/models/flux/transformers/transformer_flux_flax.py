@@ -407,6 +407,8 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   attention_kernel: str = "dot_product"
   eps: float = 1e-6
   remat_policy: str = "None"
+  names_which_can_be_saved: Tuple[str, ...] = ()
+  names_which_can_be_offloaded: Tuple[str, ...] = ()
   use_base2_exp: bool = False
   use_experimental_scheduler: bool = False
 
@@ -468,10 +470,16 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         'use_experimental_scheduler': self.use_experimental_scheduler,
     }
 
+    policy = self.gradient_checkpoint.to_jax_policy(
+        names_which_can_be_saved=list(self.names_which_can_be_saved),
+        names_which_can_be_offloaded=list(self.names_which_can_be_offloaded),
+    )
+
     # 2. Force strict checkpointing on the Double Wrapper
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=cp.save_any_names_but_these("img_qkv_proj", "txt_qkv_proj"))
+    if policy == "skip":
+      RemattedDoubleWrapper = ScannedDoubleBlockWrapper
+    else:
+      RemattedDoubleWrapper = nn.remat(ScannedDoubleBlockWrapper, prevent_cse=True, policy=policy)
 
     self.scanned_double_blocks = nn.scan(
         RemattedDoubleWrapper,
@@ -499,9 +507,10 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
     }
 
     # 4. Force strict checkpointing on the Single Wrapper
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.checkpoint_dots_with_no_batch_dims)
-    #RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host"))
-    RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=cp.save_only_these_names("attn_output", "lin1_norm_hidden_states"))
+    if policy == "skip":
+      RemattedSingleWrapper = ScannedSingleBlockWrapper
+    else:
+      RemattedSingleWrapper = nn.remat(ScannedSingleBlockWrapper, prevent_cse=True, policy=policy)
 
     self.scanned_single_blocks = nn.scan(
         RemattedSingleWrapper,
