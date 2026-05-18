@@ -178,20 +178,21 @@ class FluxSingleTransformerBlock(nn.Module):
     
     qkv_proj = qkv.reshape(B, L, K, H, D)
     q, k, v = jnp.split(qkv_proj, 3, axis=2)
-    q = q.squeeze(2).swapaxes(1, 2)
-    k = k.squeeze(2).swapaxes(1, 2)
-    v = v.squeeze(2).swapaxes(1, 2)
+    q = q.squeeze(2)
+    k = k.squeeze(2)
+    v = v.squeeze(2)
 
     q = self.attn.query_norm(q)
     k = self.attn.key_norm(k)
 
     if image_rotary_emb is not None:
       image_rotary_emb_reordered = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+      image_rotary_emb_reordered = jnp.expand_dims(image_rotary_emb_reordered, axis=1)
       q, k = apply_rope(q, k, image_rotary_emb_reordered)
 
-    q = q.transpose(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], -1)
-    k = k.transpose(0, 2, 1, 3).reshape(k.shape[0], k.shape[2], -1)
-    v = v.transpose(0, 2, 1, 3).reshape(v.shape[0], v.shape[2], -1)
+    q = q.reshape(B, L, -1)
+    k = k.reshape(B, L, -1)
+    v = v.reshape(B, L, -1)
 
     attn_output = self.attn.attention_op.apply_attention(q, k, v)
     attn_output = checkpoint_name(attn_output, "attn_output")

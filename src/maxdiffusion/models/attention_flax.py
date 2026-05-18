@@ -1844,12 +1844,9 @@ class FlaxFluxAttention(nn.Module):
       # value_proj = nn.with_logical_constraint(value_proj, self.value_axis_names)
 
     image_rotary_emb = rearrange(image_rotary_emb, "n d (i j) -> n d i j", i=2, j=2)
+    image_rotary_emb = jnp.expand_dims(image_rotary_emb, axis=1)
 
-    query_proj = query_proj.swapaxes(1, 2)
-    key_proj = key_proj.swapaxes(1, 2)
     query_proj, key_proj = apply_rope(query_proj, key_proj, image_rotary_emb)
-    query_proj = query_proj.swapaxes(1, 2)
-    key_proj = key_proj.swapaxes(1, 2)
 
     query_proj = query_proj.reshape(B, -1, H * D)
     key_proj = key_proj.reshape(B, -1, H * D)
