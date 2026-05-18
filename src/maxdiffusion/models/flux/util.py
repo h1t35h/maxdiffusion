@@ -152,10 +152,31 @@ def load_flow_model(name: str, eval_shapes: dict, device: str, hf_download: bool
       with safe_open(ckpt_path, framework="pt") as f:
         for k in f.keys():
           tensors[k] = torch2jax(f.get_tensor(k))
+      
+      from flax.traverse_util import flatten_dict, unflatten_dict
+      import numpy as np
+      
+      flat_expected = flatten_dict(eval_shapes)
       flax_state_dict = {}
       cpu = jax.local_devices(backend="cpu")[0]
+      
       for pt_key, tensor in tensors.items():
         renamed_pt_key = rename_key(pt_key)
+        
+        block_index = None
+        is_double_block = False
+        is_single_block = False
+        
+        parts = renamed_pt_key.split(".")
+        first_part = parts[0]
+        
+        if first_part.startswith("double_blocks_"):
+          is_double_block = True
+          block_index = int(first_part.replace("double_blocks_", ""))
+        elif first_part.startswith("single_blocks_"):
+          is_single_block = True
+          block_index = int(first_part.replace("single_blocks_", ""))
+
         if "double_blocks" in renamed_pt_key:
           renamed_pt_key = renamed_pt_key.replace("img_mlp_", "img_mlp.layers_")
           renamed_pt_key = renamed_pt_key.replace("txt_mlp_", "txt_mlp.layers_")
@@ -168,14 +189,19 @@ def load_flow_model(name: str, eval_shapes: dict, device: str, hf_download: bool
           renamed_pt_key = renamed_pt_key.replace("txt_attn.proj", "attn.e_proj")
           renamed_pt_key = renamed_pt_key.replace("txt_attn.norm.key_norm", "attn.encoder_key_norm")
           renamed_pt_key = renamed_pt_key.replace("txt_attn.norm.query_norm", "attn.encoder_query_norm")
+          pt_tuple_key = ("scanned_double_blocks", "FluxTransformerBlock_0") + tuple(renamed_pt_key.split(".")[1:])
+          
         elif "guidance_in" in renamed_pt_key:
           renamed_pt_key = renamed_pt_key.replace("guidance_in", "time_text_embed.FlaxTimestepEmbedding_1")
           renamed_pt_key = renamed_pt_key.replace("in_layer", "linear_1")
           renamed_pt_key = renamed_pt_key.replace("out_layer", "linear_2")
+          pt_tuple_key = tuple(renamed_pt_key.split("."))
+          
         elif "single_blocks" in renamed_pt_key:
           renamed_pt_key = renamed_pt_key.replace("modulation", "norm")
           renamed_pt_key = renamed_pt_key.replace("norm.key_norm", "attn.key_norm")
           renamed_pt_key = renamed_pt_key.replace("norm.query_norm", "attn.query_norm")
+          
           if "linear1" in renamed_pt_key:
             if tensor.ndim == 2:
               qkv_tensor = tensor[:9216, :]
@@ -185,26 +211,82 @@ def load_flow_model(name: str, eval_shapes: dict, device: str, hf_download: bool
               mlp_tensor = tensor[9216:]
             qkv_pt_key = renamed_pt_key.replace("linear1", "lin_qkv")
             mlp_pt_key = renamed_pt_key.replace("linear1", "mlp_and_out.lin_mlp")
-            flax_key_qkv, flax_tensor_qkv = rename_key_and_reshape_tensor(tuple(qkv_pt_key.split(".")), qkv_tensor, eval_shapes)
-            flax_state_dict[flax_key_qkv] = jax.device_put(jnp.asarray(flax_tensor_qkv), device=cpu)
-            flax_key_mlp, flax_tensor_mlp = rename_key_and_reshape_tensor(tuple(mlp_pt_key.split(".")), mlp_tensor, eval_shapes)
-            flax_state_dict[flax_key_mlp] = jax.device_put(jnp.asarray(flax_tensor_mlp), device=cpu)
+            
+            # Stack qkv
+            qkv_parts = qkv_pt_key.split(".")
+            qkv_tuple_key = ("scanned_single_blocks", "FluxSingleTransformerBlock_0") + tuple(qkv_parts[1:])
+            flax_key_qkv, flax_tensor_qkv = rename_key_and_reshape_tensor(qkv_tuple_key, qkv_tensor, eval_shapes)
+            
+            if flax_key_qkv in flax_state_dict:
+              stacked_qkv = flax_state_dict[flax_key_qkv]
+            else:
+              try:
+                expected_shape = flat_expected[flax_key_qkv].shape
+              except AttributeError:
+                expected_shape = flat_expected[flax_key_qkv].value.shape
+              stacked_qkv = np.zeros(expected_shape, dtype=np.float32)
+            stacked_qkv[block_index] = np.asarray(flax_tensor_qkv)
+            flax_state_dict[flax_key_qkv] = stacked_qkv
+            
+            # Stack mlp
+            mlp_parts = mlp_pt_key.split(".")
+            mlp_tuple_key = ("scanned_single_blocks", "FluxSingleTransformerBlock_0") + tuple(mlp_parts[1:])
+            flax_key_mlp, flax_tensor_mlp = rename_key_and_reshape_tensor(mlp_tuple_key, mlp_tensor, eval_shapes)
+            
+            if flax_key_mlp in flax_state_dict:
+              stacked_mlp = flax_state_dict[flax_key_mlp]
+            else:
+              try:
+                expected_shape = flat_expected[flax_key_mlp].shape
+              except AttributeError:
+                expected_shape = flat_expected[flax_key_mlp].value.shape
+              stacked_mlp = np.zeros(expected_shape, dtype=np.float32)
+            stacked_mlp[block_index] = np.asarray(flax_tensor_mlp)
+            flax_state_dict[flax_key_mlp] = stacked_mlp
             continue
+            
           elif "linear2" in renamed_pt_key:
             renamed_pt_key = renamed_pt_key.replace("linear2", "mlp_and_out.linear2")
+            
+          pt_tuple_key = ("scanned_single_blocks", "FluxSingleTransformerBlock_0") + tuple(renamed_pt_key.split(".")[1:])
+          
         elif "vector_in" in renamed_pt_key or "time_in" in renamed_pt_key:
           renamed_pt_key = renamed_pt_key.replace("vector_in", "time_text_embed.PixArtAlphaTextProjection_0")
           renamed_pt_key = renamed_pt_key.replace("time_in", "time_text_embed.FlaxTimestepEmbedding_0")
           renamed_pt_key = renamed_pt_key.replace("in_layer", "linear_1")
           renamed_pt_key = renamed_pt_key.replace("out_layer", "linear_2")
+          pt_tuple_key = tuple(renamed_pt_key.split("."))
         elif "final_layer" in renamed_pt_key:
           renamed_pt_key = renamed_pt_key.replace("final_layer.linear", "proj_out")
           renamed_pt_key = renamed_pt_key.replace("final_layer.adaLN_modulation_1", "norm_out.Dense_0")
-        pt_tuple_key = tuple(renamed_pt_key.split("."))
+          pt_tuple_key = tuple(renamed_pt_key.split("."))
+        else:
+          pt_tuple_key = tuple(renamed_pt_key.split("."))
+          
         flax_key, flax_tensor = rename_key_and_reshape_tensor(pt_tuple_key, tensor, eval_shapes)
-        flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
-      validate_flax_state_dict(eval_shapes, flax_state_dict)
-      flax_state_dict = unflatten_dict(flax_state_dict)
+        
+        if is_double_block or is_single_block:
+          if flax_key in flax_state_dict:
+            stacked_tensor = flax_state_dict[flax_key]
+          else:
+            try:
+              expected_shape = flat_expected[flax_key].shape
+            except AttributeError:
+              expected_shape = flat_expected[flax_key].value.shape
+            stacked_tensor = np.zeros(expected_shape, dtype=np.float32)
+          
+          stacked_tensor[block_index] = np.asarray(flax_tensor)
+          flax_state_dict[flax_key] = stacked_tensor
+        else:
+          flax_state_dict[flax_key] = np.asarray(flax_tensor)
+          
+      # Convert final dict to JAX arrays on Cpu device
+      jax_flax_state_dict = {}
+      for k, v in flax_state_dict.items():
+        jax_flax_state_dict[k] = jax.device_put(jnp.asarray(v), device=cpu)
+        
+      validate_flax_state_dict(eval_shapes, jax_flax_state_dict)
+      flax_state_dict = unflatten_dict(jax_flax_state_dict)
       del tensors
       jax.clear_caches()
   return flax_state_dict
