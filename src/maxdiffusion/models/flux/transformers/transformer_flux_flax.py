@@ -31,7 +31,6 @@ from ....common_types import BlockSizes
 from ....utils import BaseOutput
 from ...gradient_checkpoint import GradientCheckpointType
 from jax import checkpoint_policies as cp
-from jax.ad_checkpoint import checkpoint_name
 
 AxisNames = common_types.AxisNames
 BATCH = common_types.BATCH
@@ -140,7 +139,6 @@ class MlpAndOutputBlock(nn.Module):
         attn_mlp, ("activation_batch", "activation_length", "mlp")
     )
     hidden_states = self.linear2(attn_mlp)
-    hidden_states = checkpoint_name(hidden_states, "lin2_hidden_states")
     hidden_states = gate * hidden_states
     hidden_states = residual + hidden_states
     return hidden_states
@@ -225,7 +223,6 @@ class FluxSingleTransformerBlock(nn.Module):
     norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
     
     qkv = self.lin_qkv(norm_hidden_states)
-    qkv = checkpoint_name(qkv, "lin1_norm_hidden_states")
     qkv = nn.with_logical_constraint(qkv, ("activation_batch", "activation_length", "mlp"))
     
     B, L = hidden_states.shape[:2]
@@ -250,7 +247,6 @@ class FluxSingleTransformerBlock(nn.Module):
     v = v.reshape(B, L, -1)
 
     attn_output = self.attn.attention_op.apply_attention(q, k, v)
-    attn_output = checkpoint_name(attn_output, "attn_output")
 
     hidden_states = self.mlp_and_out(norm_hidden_states, attn_output, gate, residual)
     
