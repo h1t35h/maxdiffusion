@@ -1,0 +1,93 @@
+Ok when trying to run the training with tokamax ring and the following configuration : 
+```
+export PER_DEVICE_BATCH_SIZE=4
+export ICI_DATA_PARALLELISM=2
+export ICI_FSDP_PARALLELISM=16
+export ICI_CONTEXT_PARALLELISM=4
+export ICI_TENSOR_PARALLELISM=2
+
+python src/maxdiffusion/train_flux.py src/maxdiffusion/configs/base_flux_dev.yml \
+    run_name=${RUN_NAME} \
+    output_dir=${OUTPUT_DIR} \
+    jax_cache_dir=${OUTPUT_DIR}/${RUN_NAME}/jax_cache/ \
+    synthetic_num_samples=100 \
+    save_final_checkpoint=False \
+    max_train_steps=100 \
+    dataset_type=synthetic \
+    ici_data_parallelism=${ICI_DATA_PARALLELISM} \
+    ici_context_parallelism=${ICI_CONTEXT_PARALLELISM} \
+    ici_fsdp_parallelism=${ICI_FSDP_PARALLELISM} \
+    ici_tensor_parallelism=${ICI_TENSOR_PARALLELISM} \
+    train_new_flux=True \
+    resolution=1024 \
+    attention_sharding_uniform=True \
+    attention=tokamax_ring \
+    per_device_batch_size=${PER_DEVICE_BATCH_SIZE} \
+    enable_profiler=False \
+    remat_policy=FULL \
+    reuse_example_batch=True \
+    use_base2_exp=True \
+    write_metrics=False"
+```
+
+I'm seeing the following error: 
+```
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/maxdiffusion/trainers/flux_trainer.py", line 391, in compile_train_step
+    p_train_step = p_train_step.compile()
+                   ^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/stages.py", line 599, in compile
+    self._lowering.compile(**kw),  # pytype: disable=wrong-keyword-args
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 2510, in compile
+    executable = UnloadedMeshExecutable.from_hlo(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 3056, in from_hlo
+    xla_executable = _cached_compilation(
+                     ^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 2837, in _cached_compilation
+    xla_executable = compiler.compile_or_get_cached(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/compiler.py", line 478, in compile_or_get_cached
+    return _compile_and_write_cache(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/compiler.py", line 746, in _compile_and_write_cache
+    executable = backend_compile_and_load(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 359, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/compiler.py", line 372, in backend_compile_and_load
+    raise e
+  File "/deps/maxdiffusion/.venv/lib/python3.12/site-packages/jax/_src/compiler.py", line 362, in backend_compile_and_load
+    return backend.compile_and_load(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Allocation (size=51539607552) would exceed memory (size=33822867456) :: #allocation2157 [shape = 'bf16[1024,4096,6144]{2,1,0:T(8,128)(2,1)}', space=hbm, size = 0xffffffffffffffff, tag = 'output of all-gather.981@{}'] :: <no-hlo-instruction>
+```
+
+I went ahead and took an XLA dump which provided the following additional information : 
+```
+     %all-gather.923.cloned.1.call-done = bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)} async-done(%all-gather.923.cloned.1.call-start), metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/txt_mlp/layers_2/dot_general" stack_frame_id=433}
+  %all-gather.921.cloned.1.call-done = bf16[1024,512,6144]{2,1,0:T(8,128)(2,1)} async-done(%all-gather.921.cloned.1.call-start), metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/txt_mlp/layers_2/dot_general" stack_frame_id=433}
+  %fusion.1110 = bf16[1024,512,3072]{2,1,0:T(8,128)(2,1)} fusion(%all-gather.921.cloned.1.call-done, %all-gather.923.cloned.1.call-done), kind=kOutput, calls=%fused_computation.266.clone.clone, metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/txt_mlp/layers_2/dot_general" stack_frame_id=433}, backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"aliasing_operands":{"lists":[]}}
+  %all-gather.913.cloned.1.call-done = bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)} async-done(%all-gather.913.cloned.1.call-start), metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/img_mlp/layers_2/dot_general" stack_frame_id=407}
+  %copy-start.77 = (bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)S(1)}, bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)}, u32[]{:S(2)}) copy-start(%all-gather.913.cloned.1.call-done)
+  %all-gather.981 = bf16[1024,4096,6144]{2,1,0:T(8,128)(2,1)} all-gather(%fusion.1106), channel_id=29, replica_groups=[2,128]<=[128,2]T(1,0), dimensions={0}, use_global_device_ids=true, frontend_attributes={async_collective_name="all-gather-start.65"}, metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/img_mlp/layers_2/dot_general" stack_frame_id=407}, backend_config={"flag_configs":[],"barrier_config":{"barrier_type":"CUSTOM","id":"5"},"scoped_memory_configs":[],"used_scoped_memory_configs":[],"aliasing_operands":{"lists":[]}}
+  %copy-done.77 = bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)S(1)} copy-done(%copy-start.77)
+  %fusion.1107 = bf16[1024,4096,3072]{1,2,0:T(8,128)(2,1)} fusion(%all-gather.981, %copy-done.77), kind=kOutput, calls=%fused_computation.268.clone.clone, metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/img_mlp/layers_2/dot_general" stack_frame_id=407}, backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"aliasing_operands":{"lists":[]}}
+  %prepare_done_all-reduce.384.cloned.1.call-start = token[] custom-call(%prepare_start_all-reduce.384.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"aliasing_operands":{"lists":[]}}
+  %all-reduce.384.cloned.1.call-start = ((bf16[1024,512,3072]{2,1,0:T(8,128)(2,1)}, s32[1024]{0:T(1024)}, token[]), bf16[1024,512,3072]{2,1,0:T(8,128)(2,1)}) async-start(%fusion.1110, %copy.5268, %prepare_done_all-reduce.384.cloned.1.call-start), async_execution_thread="sparsecore", calls=%async_computation.139, metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/txt_mlp/layers_2/dot_general" stack_frame_id=433}, backend_config={"flag_configs":[],"scoped_memory_configs":[],"megachip_parallelism_config":{"cores":["1"]},"used_scoped_memory_configs":[],"sparse_core_config":{"offload":"OFFLOAD_COLLECTIVE","enable_megacore":true}}
+  %all-reduce.384.cloned.1.call-done = bf16[1024,512,3072]{2,1,0:T(8,128)(2,1)} async-done(%all-reduce.384.cloned.1.call-start), metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/txt_mlp/layers_2/dot_general" stack_frame_id=433}
+```
+also looking further I could see
+```
+  %all-gather.913.cloned.1.call-done = bf16[1,6144,3072]{1,2,0:T(8,128)(2,1)} async-done(%all-gather.913.cloned.1.call-start), metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/img_mlp/layers_2/dot_general" stack_frame_id=407}
+  %all-gather.981 = bf16[1024,4096,6144]{2,1,0:T(8,128)(2,1)} all-gather(%fusion.1106), channel_id=29, replica_groups=[2,128]<=[128,2]T(1,0), dimensions={0}, use_global_device_ids=true, frontend_attributes={async_collective_name="all-gather-start.65"}, metadata={op_name="jit(train_step)/jvp(FluxTransformer2DModel)/while/body/closed_call/scanned_double_blocks/FluxTransformerBlock_0/img_mlp/layers_2/dot_general" stack_frame_id=407}, backend_config={"flag_configs":[],"barrier_config":{"barrier_type":"CUSTOM","id":"5"},"scoped_memory_configs":[],"used_scoped_memory_configs":[],"aliasing_operands":{"lists":[]}}
+```
+Upon further investigation matches for IDs (`file_name_id=12` and `function_name_id=22`):
+
+- **File (`12`):** `"/deps/maxdiffusion/.venv/lib/python3.12/site-packages/flax/linen/linear.py"`
+- **Function (`22`):** `"Dense.__call__"`
+- **Line:** `287`
+
+Based on this information and the access to the code base suggest why are we seeing the OOM.
