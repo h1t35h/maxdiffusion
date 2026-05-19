@@ -94,14 +94,6 @@ class FluxFeedForward(nn.Module):
     mid = nn.with_logical_constraint(
         mid, ("activation_batch", "activation_length", "mlp")
     )
-    # TEMP DEBUG: confirm SPMD honored the constraint. Expect
-    #   NamedSharding(PartitionSpec(('data','fsdp'), 'context', 'tensor'))
-    # If batch ends up on context or tensor, or length stays replicated, the
-    # over-shard from data_sharding is still leaking through and we need to
-    # switch to a NamedSharding-based jax.lax.with_sharding_constraint.
-    jax.debug.inspect_array_sharding(
-        mid, callback=lambda s: jax.debug.print("MID SHARDING: {}", s)
-    )
     return self.layers_2(mid)
 
 
@@ -188,7 +180,7 @@ class FluxSingleTransformerBlock(nn.Module):
         precision=self.precision,
     )
 
-    self.mlp_and_out = nn.remat(MlpAndOutputBlock, prevent_cse=True)(
+    self.mlp_and_out = MlpAndOutputBlock(
         dim=self.dim,
         mlp_ratio=self.mlp_ratio,
         dtype=self.dtype,
