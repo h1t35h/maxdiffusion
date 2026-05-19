@@ -53,6 +53,59 @@ class Transformer2DModelOutput(BaseOutput):
   sample: jnp.ndarray
 
 
+class FluxFeedForward(nn.Module):
+  """Replaces nn.Sequential([Dense_in, gelu, Dense_out]) so we can pin a
+  with_logical_constraint on the wide gelu intermediate. Without the constraint
+  XLA is free to drop batch/length sharding on the (B, L, mlp_hidden)
+  intermediate and materialize the full activation per device. Child param
+  names (layers_0, layers_2) match nn.Sequential's auto-naming so the from_pt
+  loader (modeling_flax_pytorch_utils._img_mlp_0 -> .img_mlp.layers_0) still
+  resolves.
+  """
+
+  dim: int
+  mlp_ratio: float
+  dtype: jnp.dtype
+  weights_dtype: jnp.dtype
+  precision: jax.lax.Precision = None
+
+  def setup(self):
+    self.layers_0 = nn.Dense(
+        int(self.dim * self.mlp_ratio),
+        use_bias=True,
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+    self.layers_2 = nn.Dense(
+        self.dim,
+        use_bias=True,
+        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
+        bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+
+  def __call__(self, x):
+    mid = self.layers_0(x)
+    mid = nn.gelu(mid)
+    mid = nn.with_logical_constraint(
+        mid, ("activation_batch", "activation_length", "mlp")
+    )
+    # TEMP DEBUG: confirm SPMD honored the constraint. Expect
+    #   NamedSharding(PartitionSpec(('data','fsdp'), 'context', 'tensor'))
+    # If batch ends up on context or tensor, or length stays replicated, the
+    # over-shard from data_sharding is still leaking through and we need to
+    # switch to a NamedSharding-based jax.lax.with_sharding_constraint.
+    jax.debug.inspect_array_sharding(
+        mid, callback=lambda s: jax.debug.print("MID SHARDING: {}", s)
+    )
+    return self.layers_2(mid)
+
+
 class MlpAndOutputBlock(nn.Module):
   dim: int
   mlp_ratio: float = 4.0
@@ -162,9 +215,11 @@ class FluxSingleTransformerBlock(nn.Module):
   def __call__(self, hidden_states, temb, image_rotary_emb=None):
     residual = hidden_states
     
-    # FIX: Constrain inputs using valid config parameters
+    # Inter-block activation: feature dim MUST be None. Using "embed" here
+    # collides with activation_batch on the fsdp axis (both map to fsdp); SPMD
+    # then drops fsdp from batch and re-introduces the over-shard.
     hidden_states = nn.with_logical_constraint(
-        hidden_states, ("activation_batch", "activation_length", "embed")
+        hidden_states, ("activation_batch", "activation_length", None)
     )
     
     norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
@@ -246,54 +301,28 @@ class FluxTransformerBlock(nn.Module):
     # REMOVED: self.img_norm2 and self.txt_norm2 completely to stop HBM memory spilling.
     # The mathematical reductions are handled natively below.
 
-    self.img_mlp = nn.Sequential([
-        nn.Dense(
-            int(self.dim * self.mlp_ratio),
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-        nn.gelu,
-        nn.Dense(
-            self.dim,
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-    ])
-
-    self.txt_mlp = nn.Sequential([
-        nn.Dense(
-            int(self.dim * self.mlp_ratio),
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-        nn.gelu,
-        nn.Dense(
-            self.dim,
-            use_bias=True,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
-            bias_init=nn.with_logical_partitioning(nn.initializers.zeros, (None,)),
-            dtype=self.dtype,
-            param_dtype=self.weights_dtype,
-            precision=self.precision,
-        ),
-    ])
+    self.img_mlp = FluxFeedForward(
+        dim=self.dim,
+        mlp_ratio=self.mlp_ratio,
+        dtype=self.dtype,
+        weights_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
+    self.txt_mlp = FluxFeedForward(
+        dim=self.dim,
+        mlp_ratio=self.mlp_ratio,
+        dtype=self.dtype,
+        weights_dtype=self.weights_dtype,
+        precision=self.precision,
+    )
 
   def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None):
     # Enforce active partitioning based on your FSDP setup config
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "embed"))
-    encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", "activation_kv_length", "embed"))
+    # Feature dim must be None — see note in single block. "embed" here would
+    # put fsdp on both batch and feature dims, which is an SPMD invariant
+    # violation and silently degrades the sharding.
+    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", None))
+    encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", "activation_kv_length", None))
 
     # 1. First Adaptive Normalization Pass
     norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.img_norm1(hidden_states, emb=temb)
@@ -318,7 +347,7 @@ class FluxTransformerBlock(nn.Module):
     img_inv_std = jax.lax.rsqrt(img_var + self.eps)
     
     norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
-    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", "activation_length", "embed"))
+    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", "activation_length", None))
 
     ff_output = self.img_mlp(norm_hidden_states)
     hidden_states = hidden_states + gate_mlp * ff_output
@@ -333,7 +362,7 @@ class FluxTransformerBlock(nn.Module):
     txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
 
     norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
-    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", "activation_kv_length", "embed"))
+    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", "activation_kv_length", None))
 
     context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
     encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
@@ -613,7 +642,7 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
     hidden_states, encoder_hidden_states, _, _ = carry
 
     hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", "embed"))
+    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", "activation_length", None))
     
     # Execute the 38 Single Blocks
     carry = (hidden_states, temb, image_rotary_emb)
